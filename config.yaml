@@ -1,0 +1,20 @@
+# LlyKafka 应用配置（由 GoFrame gcfg 加载）
+app:
+  name: "LlyKafka"
+  version: "0.1.0"
+  # 新建连接时默认的 broker 地址
+  default_brokers: "127.0.0.1:9092"
+  # 消息浏览相关
+  fetch_max_messages: 500    # 单次拉取消息上限
+  default_message_count: 50  # “最新 N 条”默认 N
+  message_preview_len: 200   # 消息 Value 预览最大字符数
+
+# 持久化
+store:
+  connections_file: "data/connections.json"
+
+# 日志配置（glog 自动读取 logger 段）
+logger:
+  path: "logs"
+  level: "info"
+  stdout: true

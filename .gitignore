@@ -1,0 +1,21 @@
+# 编译产物
+/lly_kafka
+/lly_kafka.exe
+/lly_kafka.app
+/build/
+/dist/
+
+# 数据与日志
+/data/
+/logs/
+
+# Go
+/vendor/
+
+# IDE
+/.idea/
+/.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
