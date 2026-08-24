@@ -12,9 +12,10 @@ import (
 )
 
 type brokersPanel struct {
-	win    fyne.Window
-	client *core.KafkaClient
-	loaded bool
+	win        fyne.Window
+	client     *core.KafkaClient
+	loaded     bool
+	refreshSeq uint64
 
 	rows  []core.BrokerInfo
 	table *widget.Table
@@ -104,11 +105,13 @@ func (p *brokersPanel) refresh() {
 	if p.info == nil {
 		return
 	}
+	p.refreshSeq++
+	seq := p.refreshSeq
 	p.info.SetText("刷新中...")
 	fetchAndShow(p.client.Context(), func() ([]core.BrokerInfo, error) {
 		return p.client.ListBrokers(p.client.Context())
 	}, func(rows []core.BrokerInfo, err error) {
-		if p.info == nil || p.table == nil {
+		if seq != p.refreshSeq || p.info == nil || p.table == nil {
 			return
 		}
 		if err != nil {

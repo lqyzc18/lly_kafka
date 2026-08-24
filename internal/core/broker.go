@@ -19,6 +19,9 @@ type BrokerInfo struct {
 
 // ListBrokers 返回集群内全部 Broker，包含控制器标识。
 func (kc *KafkaClient) ListBrokers(ctx context.Context) ([]BrokerInfo, error) {
+	if err := kc.alive(ctx); err != nil {
+		return nil, err
+	}
 	controllerID := int32(-1)
 	if c, err := kc.admin.Controller(); err == nil && c != nil {
 		controllerID = c.ID()

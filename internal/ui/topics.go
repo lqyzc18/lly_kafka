@@ -17,9 +17,10 @@ import (
 
 // topicsPanel Topic 列表与详情 Tab。
 type topicsPanel struct {
-	win    fyne.Window
-	client *core.KafkaClient
-	loaded bool
+	win        fyne.Window
+	client     *core.KafkaClient
+	loaded     bool
+	refreshSeq uint64
 
 	search    *widget.Entry
 	list      *widget.List
@@ -184,6 +185,22 @@ func (p *topicsPanel) applyFilter() {
 		q = p.search.Text
 	}
 	p.filtered = filterTopics(p.topics, q)
+	if p.selected != "" && !contains(p.filtered, p.selected) {
+		p.selected = ""
+		if p.list != nil {
+			p.list.UnselectAll()
+		}
+		if p.detailTtl != nil {
+			p.detailTtl.SetText("请选择 Topic")
+		}
+		if p.infoLbl != nil {
+			p.infoLbl.SetText("")
+		}
+		p.parts = nil
+		if p.partTable != nil {
+			p.partTable.Refresh()
+		}
+	}
 }
 
 func (p *topicsPanel) ensureLoaded() {
@@ -195,9 +212,14 @@ func (p *topicsPanel) ensureLoaded() {
 }
 
 func (p *topicsPanel) refresh() {
+	p.refreshSeq++
+	seq := p.refreshSeq
 	fetchAndShow(p.client.Context(), func() ([]string, error) {
 		return p.client.RefreshTopicNames(p.client.Context())
 	}, func(names []string, err error) {
+		if seq != p.refreshSeq {
+			return
+		}
 		if err != nil {
 			showError(p.win, "获取 Topic 列表失败", err)
 			return

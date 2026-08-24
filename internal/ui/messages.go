@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -45,6 +46,7 @@ type messagesPanel struct {
 	allRows     []core.MessageInfo
 	rows        []core.MessageInfo
 	fetchCancel context.CancelFunc
+	fetchSeq    uint64
 	restorePart string
 }
 
@@ -292,6 +294,8 @@ func (p *messagesPanel) applyMsgFilter() {
 
 func (p *messagesPanel) onCancelFetch() {
 	if p.fetchCancel != nil {
+		p.statusLbl.SetText("正在取消...")
+		p.btnCancel.Disable()
 		p.fetchCancel()
 	}
 }
@@ -320,6 +324,8 @@ func (p *messagesPanel) onFetch() {
 	if p.fetchCancel != nil {
 		p.fetchCancel()
 	}
+	p.fetchSeq++
+	seq := p.fetchSeq
 	fetchCtx, cancel := context.WithCancel(p.client.Context())
 	p.fetchCancel = cancel
 
@@ -340,15 +346,35 @@ func (p *messagesPanel) onFetch() {
 		}
 		return p.client.FetchMessages(fetchCtx, topic, part, start, end, max)
 	}, func(msgs []core.MessageInfo, err error) {
+		if seq != p.fetchSeq {
+			return
+		}
 		p.btnFetch.Enable()
 		p.btnCancel.Disable()
+		p.fetchCancel = nil
+		cancelled := errors.Is(err, context.Canceled)
+		timedOut := errors.Is(err, context.DeadlineExceeded)
+		if len(msgs) > 0 {
+			p.allRows = msgs
+			p.applyMsgFilter()
+		}
+		if cancelled {
+			p.statusLbl.SetText(fmt.Sprintf("已取消，收到 %d 条消息", len(msgs)))
+			return
+		}
+		if timedOut {
+			p.statusLbl.SetText(fmt.Sprintf("超时，收到 %d 条消息", len(msgs)))
+			return
+		}
 		if err != nil {
-			p.statusLbl.SetText("拉取失败")
+			p.statusLbl.SetText(fmt.Sprintf("拉取不完整，收到 %d 条消息", len(msgs)))
 			showError(p.win, "拉取消息失败", err)
 			return
 		}
-		p.allRows = msgs
-		p.applyMsgFilter()
+		if len(msgs) == 0 {
+			p.allRows = nil
+			p.applyMsgFilter()
+		}
 		if len(p.allRows) == len(p.rows) {
 			p.statusLbl.SetText(fmt.Sprintf("共 %d 条消息", len(msgs)))
 		}

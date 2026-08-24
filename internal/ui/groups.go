@@ -13,9 +13,11 @@ import (
 )
 
 type groupsPanel struct {
-	win    fyne.Window
-	client *core.KafkaClient
-	loaded bool
+	win        fyne.Window
+	client     *core.KafkaClient
+	loaded     bool
+	refreshSeq uint64
+	resetting  bool
 
 	allGroups []core.GroupInfo
 	groups    []core.GroupInfo
@@ -121,6 +123,28 @@ func (p *groupsPanel) applyFilter() {
 		}
 	}
 	p.groups = out
+	if p.selected != "" {
+		found := false
+		for _, group := range p.groups {
+			if group.Name == p.selected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			p.selected = ""
+			if p.list != nil {
+				p.list.UnselectAll()
+			}
+			if p.infoHead != nil {
+				p.infoHead.SetText("请选择消费组")
+			}
+			p.rows = nil
+			if p.table != nil {
+				p.table.Refresh()
+			}
+		}
+	}
 }
 
 func (p *groupsPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
@@ -175,9 +199,14 @@ func (p *groupsPanel) ensureLoaded() {
 }
 
 func (p *groupsPanel) refresh() {
+	p.refreshSeq++
+	seq := p.refreshSeq
 	fetchAndShow(p.client.Context(), func() ([]core.GroupInfo, error) {
 		return p.client.ListGroups(p.client.Context())
 	}, func(groups []core.GroupInfo, err error) {
+		if seq != p.refreshSeq {
+			return
+		}
 		if err != nil {
 			showError(p.win, "获取消费组失败", err)
 			return
@@ -228,12 +257,18 @@ func (p *groupsPanel) onReset(to string) {
 			if !ok {
 				return
 			}
+			if p.resetting {
+				showInfo(p.win, "提示", "正在重置 Offset，请稍候")
+				return
+			}
+			p.resetting = true
 			go func() {
 				err := p.client.ResetGroupOffsets(p.client.Context(), group, to)
 				fyne.Do(func() {
 					if p.client.Context().Err() != nil {
 						return
 					}
+					p.resetting = false
 					if err != nil {
 						showError(p.win, "重置失败", err)
 						return

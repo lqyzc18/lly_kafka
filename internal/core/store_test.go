@@ -46,3 +46,13 @@ func TestConnectionStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestConnectionStoreRejectsNilUpsert(t *testing.T) {
+	s, err := NewConnectionStore(filepath.Join(t.TempDir(), "connections.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Upsert(nil); err == nil {
+		t.Fatal("Upsert(nil) should return an error")
+	}
+}

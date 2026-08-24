@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -20,10 +21,14 @@ type MainWindow struct {
 	cfg     *core.AppConfig
 	store   *core.ConnectionStore
 
-	mu         sync.Mutex
-	connectSeq uint64
-	client     *core.KafkaClient
-	conn       *core.Connection
+	mu          sync.Mutex
+	connectSeq  uint64
+	testSeq     uint64
+	client      *core.KafkaClient
+	conn        *core.Connection
+	windowCtx   context.Context
+	windowStop  context.CancelFunc
+	connectStop context.CancelFunc
 
 	root    *fyne.Container
 	toolbar *fyne.Container
@@ -74,6 +79,7 @@ func Run() {
 		cfg:     cfg,
 		store:   store,
 	}
+	mw.windowCtx, mw.windowStop = context.WithCancel(context.Background())
 	mw.build()
 	w.SetContent(mw.root)
 	startCJKFontLoader(a, func() {
@@ -90,9 +96,15 @@ func Run() {
 		}
 		mw.mu.Lock()
 		mw.connectSeq++
+		mw.testSeq++
+		if mw.connectStop != nil {
+			mw.connectStop()
+			mw.connectStop = nil
+		}
 		c := mw.client
 		mw.client, mw.conn = nil, nil
 		mw.mu.Unlock()
+		mw.windowStop()
 		if c != nil {
 			c.Close()
 		}
@@ -156,6 +168,25 @@ func (mw *MainWindow) bumpSeqLocked() uint64 {
 	return mw.connectSeq
 }
 
+func (mw *MainWindow) beginTest() (context.Context, uint64) {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	mw.testSeq++
+	return mw.windowCtx, mw.testSeq
+}
+
+func (mw *MainWindow) testCurrent(seq uint64) bool {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	return mw.windowCtx.Err() == nil && mw.testSeq == seq
+}
+
+func (mw *MainWindow) connected() bool {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	return mw.client != nil
+}
+
 func (mw *MainWindow) takeClientLocked() *core.KafkaClient {
 	c := mw.client
 	mw.client, mw.conn = nil, nil
@@ -175,11 +206,17 @@ func (mw *MainWindow) onConnect() {
 	}
 
 	mw.connBtn.Disable()
-	mw.discBtn.Disable()
+	mw.discBtn.Enable()
 	mw.setStatus("正在连接...", widget.WarningImportance)
 
 	mw.mu.Lock()
 	seq := mw.bumpSeqLocked()
+	mw.testSeq++
+	if mw.connectStop != nil {
+		mw.connectStop()
+	}
+	connectCtx, connectStop := context.WithCancel(mw.windowCtx)
+	mw.connectStop = connectStop
 	old := mw.takeClientLocked()
 	mw.mu.Unlock()
 	if old != nil {
@@ -187,19 +224,25 @@ func (mw *MainWindow) onConnect() {
 	}
 
 	go func() {
-		client, err := core.NewKafkaClient(core.Ctx, conn)
+		client, err := core.NewKafkaClient(connectCtx, conn)
 		fyne.Do(func() {
 			mw.mu.Lock()
 			stale := mw.connectSeq != seq
+			if mw.connectSeq == seq {
+				mw.connectStop = nil
+			}
 			mw.mu.Unlock()
 			if stale {
+				connectStop()
 				if client != nil {
 					go client.Close()
 				}
 				return
 			}
 			if err != nil {
+				connectStop()
 				mw.connBtn.Enable()
+				mw.discBtn.Disable()
 				mw.setStatus("未连接", widget.DangerImportance)
 				showError(mw.win, "连接失败", err)
 				return
@@ -225,6 +268,11 @@ func (mw *MainWindow) onConnect() {
 func (mw *MainWindow) onDisconnect() {
 	mw.mu.Lock()
 	mw.bumpSeqLocked()
+	mw.testSeq++
+	if mw.connectStop != nil {
+		mw.connectStop()
+		mw.connectStop = nil
+	}
 	client := mw.takeClientLocked()
 	mw.mu.Unlock()
 	if client != nil {

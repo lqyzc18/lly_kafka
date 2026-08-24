@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -62,6 +61,31 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 	certE.SetPlaceHolder("客户端证书路径（可选）")
 	keyE := widget.NewEntry()
 	keyE.SetPlaceHolder("客户端私钥路径（可选）")
+	updateSecurityFields := func(sec string) {
+		sasl := sec == core.SecuritySASLPlaintext || sec == core.SecuritySASLSSL
+		tls := sec == core.SecuritySSL || sec == core.SecuritySASLSSL
+		if sasl {
+			saslSel.Enable()
+			userE.Enable()
+			passE.Enable()
+		} else {
+			saslSel.Disable()
+			userE.Disable()
+			passE.Disable()
+		}
+		if tls {
+			skipTLS.Enable()
+			caE.Enable()
+			certE.Enable()
+			keyE.Enable()
+		} else {
+			skipTLS.Disable()
+			caE.Disable()
+			certE.Disable()
+			keyE.Disable()
+		}
+	}
+	secSel.OnChanged = updateSecurityFields
 
 	if editing != nil {
 		nameE.SetText(editing.Name)
@@ -97,13 +121,14 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 		secSel.SetSelected(core.SecurityPlaintext)
 		saslSel.SetSelected(core.SASLPlain)
 	}
+	updateSecurityFields(secSel.Selected)
 
 	collect := func() *core.Connection {
 		ver := versionSel.Selected
 		if strings.HasPrefix(ver, "自动") || ver == "" {
 			ver = "2.6.0"
 		}
-		return &core.Connection{
+		conn := &core.Connection{
 			Name:          strings.TrimSpace(nameE.Text),
 			Brokers:       strings.TrimSpace(brokersE.Text),
 			Version:       ver,
@@ -118,17 +143,32 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 			TLSCertFile:   strings.TrimSpace(certE.Text),
 			TLSKeyFile:    strings.TrimSpace(keyE.Text),
 		}
+		if conn.Security != core.SecuritySASLPlaintext && conn.Security != core.SecuritySASLSSL {
+			conn.SASLMechanism, conn.SASLUsername, conn.SASLPassword = "", "", ""
+		}
+		if conn.Security != core.SecuritySSL && conn.Security != core.SecuritySASLSSL {
+			conn.TLSInsecure = false
+			conn.TLSCAFile, conn.TLSCertFile, conn.TLSKeyFile = "", "", ""
+		}
+		return conn
 	}
 
-	testBtn := widget.NewButton("测试连接", func() {
+	var testBtn *widget.Button
+	testBtn = widget.NewButton("测试连接", func() {
 		c := collect()
 		if c.Name == "" || c.Brokers == "" {
 			showInfo(mw.win, "提示", "请先填写名称和 Broker 地址")
 			return
 		}
+		testCtx, seq := mw.beginTest()
+		testBtn.Disable()
 		go func() {
-			ver, n, err := core.TestConnection(context.Background(), c)
+			ver, n, err := core.TestConnection(testCtx, c)
 			fyne.Do(func() {
+				if !mw.testCurrent(seq) {
+					return
+				}
+				testBtn.Enable()
 				if err != nil {
 					showError(mw.win, "测试失败", err)
 					return
@@ -205,10 +245,14 @@ func (mw *MainWindow) onTestConn() {
 		return
 	}
 	mw.setStatus("测试连接中...", widget.WarningImportance)
+	testCtx, seq := mw.beginTest()
 	go func() {
-		ver, n, err := core.TestConnection(context.Background(), conn)
+		ver, n, err := core.TestConnection(testCtx, conn)
 		fyne.Do(func() {
-			if mw.client == nil {
+			if !mw.testCurrent(seq) {
+				return
+			}
+			if !mw.connected() {
 				if err != nil {
 					mw.setStatus("未连接", widget.DangerImportance)
 				} else {

@@ -46,7 +46,7 @@ func (kc *KafkaClient) ListTopicNames(ctx context.Context) ([]string, error) {
 
 // RefreshTopicNames 强制刷新 Topic 列表并更新缓存。
 func (kc *KafkaClient) RefreshTopicNames(ctx context.Context) ([]string, error) {
-	if err := ctxErr(ctx); err != nil {
+	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
 	details, err := kc.admin.ListTopics()
@@ -69,7 +69,7 @@ func (kc *KafkaClient) RefreshTopicNames(ctx context.Context) ([]string, error) 
 
 // TopicDetail 返回 Topic 的详细信息（含各分区的 Leader/ISR/Offset 等）。
 func (kc *KafkaClient) TopicDetail(ctx context.Context, name string) (*TopicInfo, error) {
-	if err := ctxErr(ctx); err != nil {
+	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
 	metas, err := kc.admin.DescribeTopics([]string{name})
@@ -138,6 +138,9 @@ func (kc *KafkaClient) TopicDetail(ctx context.Context, name string) (*TopicInfo
 
 // CreateTopic 创建一个 Topic。
 func (kc *KafkaClient) CreateTopic(ctx context.Context, name string, partitions int32, replication int16, configs map[string]string) error {
+	if err := kc.alive(ctx); err != nil {
+		return err
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return errors.New("Topic 名称不能为空")
@@ -163,6 +166,9 @@ func (kc *KafkaClient) CreateTopic(ctx context.Context, name string, partitions 
 
 // DeleteTopic 删除一个 Topic。
 func (kc *KafkaClient) DeleteTopic(ctx context.Context, name string) error {
+	if err := kc.alive(ctx); err != nil {
+		return err
+	}
 	if strings.TrimSpace(name) == "" {
 		return errors.New("Topic 名称不能为空")
 	}
@@ -176,6 +182,9 @@ func (kc *KafkaClient) DeleteTopic(ctx context.Context, name string) error {
 
 // ExpandPartitions 将 Topic 分区数扩容到 count（只能增加）。
 func (kc *KafkaClient) ExpandPartitions(ctx context.Context, name string, count int32) error {
+	if err := kc.alive(ctx); err != nil {
+		return err
+	}
 	if count <= 0 {
 		return errors.New("分区数必须大于 0")
 	}
@@ -189,6 +198,9 @@ func (kc *KafkaClient) ExpandPartitions(ctx context.Context, name string, count 
 
 // AlterTopicConfig 增量修改 Topic 配置。
 func (kc *KafkaClient) AlterTopicConfig(ctx context.Context, name string, configs map[string]string) error {
+	if err := kc.alive(ctx); err != nil {
+		return err
+	}
 	if len(configs) == 0 {
 		return errors.New("配置不能为空")
 	}
@@ -211,6 +223,9 @@ func (p PartitionInfo) UnderReplicated() bool {
 
 // PartitionCount 快速获取 Topic 的分区数。
 func (kc *KafkaClient) PartitionCount(ctx context.Context, name string) (int, error) {
+	if err := kc.alive(ctx); err != nil {
+		return 0, err
+	}
 	metas, err := kc.admin.DescribeTopics([]string{name})
 	if err != nil {
 		return 0, err

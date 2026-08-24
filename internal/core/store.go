@@ -1,10 +1,12 @@
 package core
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/gogf/gf/v2/encoding/gjson"
-	"github.com/gogf/gf/v2/os/gfile"
 	"github.com/gogf/gf/v2/text/gstr"
 )
 
@@ -54,7 +56,7 @@ type ConnectionStore struct {
 // NewConnectionStore 加载连接存储（文件不存在时返回空存储）。
 func NewConnectionStore(file string) (*ConnectionStore, error) {
 	s := &ConnectionStore{file: file, conns: []*Connection{}}
-	if gfile.Exists(file) {
+	if _, err := os.Stat(file); err == nil {
 		j, err := gjson.Load(file)
 		if err != nil {
 			return nil, err
@@ -99,7 +101,7 @@ func (s *ConnectionStore) Get(name string) *Connection {
 // Upsert 新增或更新连接并持久化（按 Name 匹配）。
 func (s *ConnectionStore) Upsert(c *Connection) error {
 	if c == nil {
-		return nil
+		return errors.New("连接配置不能为空")
 	}
 	cp := cloneConn(c)
 	s.mu.Lock()
@@ -131,10 +133,37 @@ func (s *ConnectionStore) Remove(name string) error {
 // saveLocked 写出 JSON 文件（调用方需持有 mu 写锁）。
 func (s *ConnectionStore) saveLocked() error {
 	data := gjson.MustEncode(s.conns)
-	if dir := gfile.Dir(s.file); dir != "" && !gfile.Exists(dir) {
-		if err := gfile.Mkdir(dir); err != nil {
-			return err
-		}
+	dir := filepath.Dir(s.file)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
-	return gfile.PutContents(s.file, gstr.TrimRight(string(data), "\n"))
+	// Best effort: POSIX honors these permissions; Windows keeps its ACLs.
+	_ = os.Chmod(dir, 0o700)
+
+	tmp, err := os.CreateTemp(dir, ".connections-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(gstr.TrimRight(string(data), "\n")); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, s.file); err != nil {
+		return err
+	}
+	return os.Chmod(s.file, 0o600)
 }

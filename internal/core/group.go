@@ -32,7 +32,7 @@ type GroupTopicOffset struct {
 
 // ListGroups 返回全部消费组信息。
 func (kc *KafkaClient) ListGroups(ctx context.Context) ([]GroupInfo, error) {
-	if err := ctxErr(ctx); err != nil {
+	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
 	summaries, err := kc.admin.ListConsumerGroups()
@@ -76,7 +76,7 @@ func (kc *KafkaClient) ListGroups(ctx context.Context) ([]GroupInfo, error) {
 // GroupOffsets 返回消费组在所有 Topic/分区上的消费进度与 lag。
 // 内部使用 admin.ListConsumerGroupOffsets 的「全部 topic」模式（topics=nil）。
 func (kc *KafkaClient) GroupOffsets(ctx context.Context, group string) ([]GroupTopicOffset, error) {
-	if err := ctxErr(ctx); err != nil {
+	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
 	resp, err := kc.admin.ListConsumerGroupOffsets(group, nil)
@@ -142,7 +142,7 @@ func GroupLagSummary(rows []GroupTopicOffset) (totalLag int64, lagPartitions int
 
 // ResetGroupOffsets 将消费组所有已提交分区重置到最新或最早。
 func (kc *KafkaClient) ResetGroupOffsets(ctx context.Context, group, to string) error {
-	if err := ctxErr(ctx); err != nil {
+	if err := kc.alive(ctx); err != nil {
 		return err
 	}
 	group = strings.TrimSpace(group)
@@ -156,17 +156,7 @@ func (kc *KafkaClient) ResetGroupOffsets(ctx context.Context, group, to string) 
 	if len(rows) == 0 {
 		return errors.New("该消费组没有已提交的分区")
 	}
-	broker, err := kc.client.Coordinator(group)
-	if err != nil {
-		return err
-	}
-	req := &sarama.OffsetCommitRequest{
-		Version:                 2,
-		ConsumerGroup:           group,
-		ConsumerID:              "",
-		ConsumerGroupGeneration: -1,
-		RetentionTime:           -1,
-	}
+	offsets := make(map[string]map[int32]sarama.OffsetAndMetadata)
 	for _, r := range rows {
 		if err := ctxErr(ctx); err != nil {
 			return err
@@ -185,9 +175,15 @@ func (kc *KafkaClient) ResetGroupOffsets(ctx context.Context, group, to string) 
 			}
 			off = hwm
 		}
-		req.AddBlock(r.Topic, r.Partition, off, 0, "")
+		if offsets[r.Topic] == nil {
+			offsets[r.Topic] = make(map[int32]sarama.OffsetAndMetadata)
+		}
+		offsets[r.Topic][r.Partition] = sarama.OffsetAndMetadata{
+			Offset:      off,
+			LeaderEpoch: -1,
+		}
 	}
-	resp, err := broker.CommitOffset(req)
+	resp, err := kc.admin.AlterConsumerGroupOffsets(group, offsets, nil)
 	if err != nil {
 		return err
 	}

@@ -29,6 +29,7 @@ type KafkaClient struct {
 
 	topicMu    sync.RWMutex
 	topicNames []string
+	fetches    sync.WaitGroup
 }
 
 // NewKafkaClient 根据连接配置创建 Kafka 客户端。
@@ -136,6 +137,9 @@ func (kc *KafkaClient) Close() {
 	if cancel != nil {
 		cancel()
 	}
+	// Sarama requires partition consumers to finish before their shared
+	// Consumer/Admin client is closed.
+	kc.fetches.Wait()
 	if producer != nil {
 		_ = producer.Close()
 	}
@@ -154,6 +158,31 @@ func (kc *KafkaClient) invalidateTopics() {
 	kc.topicMu.Lock()
 	kc.topicNames = nil
 	kc.topicMu.Unlock()
+}
+
+func (kc *KafkaClient) alive(ctx context.Context) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	kc.mu.Lock()
+	defer kc.mu.Unlock()
+	if kc.closed {
+		return errClientClosed
+	}
+	return nil
+}
+
+func (kc *KafkaClient) beginFetch(ctx context.Context) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	kc.mu.Lock()
+	defer kc.mu.Unlock()
+	if kc.closed {
+		return errClientClosed
+	}
+	kc.fetches.Add(1)
+	return nil
 }
 
 // Connection 返回关联的连接配置副本。

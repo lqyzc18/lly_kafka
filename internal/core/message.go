@@ -2,6 +2,9 @@ package core
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"sort"
 	"sync"
 	"time"
@@ -32,17 +35,24 @@ type MessageInfo struct {
 
 // NewestOffset 返回分区的最新 offset（HighWaterMark）。
 func (kc *KafkaClient) NewestOffset(ctx context.Context, topic string, partition int32) (int64, error) {
-	_ = ctx
+	if err := kc.alive(ctx); err != nil {
+		return 0, err
+	}
 	return kc.client.GetOffset(topic, partition, sarama.OffsetNewest)
 }
 
 // OldestOffset 返回分区的最旧 offset。
 func (kc *KafkaClient) OldestOffset(ctx context.Context, topic string, partition int32) (int64, error) {
-	_ = ctx
+	if err := kc.alive(ctx); err != nil {
+		return 0, err
+	}
 	return kc.client.GetOffset(topic, partition, sarama.OffsetOldest)
 }
 
 func (kc *KafkaClient) oldestAndNewest(ctx context.Context, topic string, partition int32) (oldest, hwm int64, err error) {
+	if err := kc.alive(ctx); err != nil {
+		return 0, 0, err
+	}
 	var oerr, nerr error
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -131,16 +141,12 @@ func (kc *KafkaClient) FetchLatestAll(ctx context.Context, topic string, n, max 
 		results[i] = partResult{msgs: msgs, err: e}
 	})
 	var all []MessageInfo
-	var firstErr error
+	var errs []error
 	for _, r := range results {
-		if r.err != nil && firstErr == nil {
-			firstErr = r.err
-			continue
-		}
 		all = append(all, r.msgs...)
-	}
-	if len(all) == 0 && firstErr != nil {
-		return nil, firstErr
+		if r.err != nil {
+			errs = append(errs, r.err)
+		}
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if !all[i].Timestamp.Equal(all[j].Timestamp) {
@@ -154,7 +160,7 @@ func (kc *KafkaClient) FetchLatestAll(ctx context.Context, topic string, n, max 
 	if len(all) > max {
 		all = all[:max]
 	}
-	return all, nil
+	return all, errors.Join(errs...)
 }
 
 // FetchMessagesAll 对全部分区应用同一 offset 范围，合计不超过 max。
@@ -191,16 +197,12 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 		results[i] = partResult{msgs: msgs, err: e}
 	})
 	var all []MessageInfo
-	var firstErr error
+	var errs []error
 	for _, r := range results {
-		if r.err != nil && firstErr == nil {
-			firstErr = r.err
-			continue
-		}
 		all = append(all, r.msgs...)
-	}
-	if len(all) == 0 && firstErr != nil {
-		return nil, firstErr
+		if r.err != nil {
+			errs = append(errs, r.err)
+		}
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].Partition != all[j].Partition {
@@ -211,7 +213,7 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 	if len(all) > max {
 		all = all[:max]
 	}
-	return all, nil
+	return all, errors.Join(errs...)
 }
 
 func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition int32, oldest, hwm, start, end int64, max int) ([]MessageInfo, error) {
@@ -219,6 +221,10 @@ func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition i
 	if from >= toEx {
 		return []MessageInfo{}, nil
 	}
+	if err := kc.beginFetch(ctx); err != nil {
+		return nil, err
+	}
+	defer kc.fetches.Done()
 
 	consumer, err := kc.getConsumer()
 	if err != nil {
@@ -242,7 +248,7 @@ func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition i
 		select {
 		case m, ok := <-pc.Messages():
 			if !ok {
-				return msgs, nil
+				return msgs, fmt.Errorf("消息流提前结束: %w", io.ErrUnexpectedEOF)
 			}
 			msgs = append(msgs, toMessageInfo(m))
 		case e, ok := <-pc.Errors():
@@ -250,13 +256,10 @@ func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition i
 				continue
 			}
 			g.Log().Warningf(ctx, "拉取消息出错: %v，已返回 %d 条", e.Err, len(msgs))
-			if len(msgs) == 0 {
-				return nil, e.Err
-			}
-			return msgs, nil
+			return msgs, e.Err
 		case <-ctx.Done():
 			g.Log().Warningf(ctx, "拉取消息超时/取消，已返回 %d 条", len(msgs))
-			return msgs, nil
+			return msgs, fmt.Errorf("拉取未完成: %w", ctx.Err())
 		}
 	}
 	return msgs, nil
@@ -264,6 +267,9 @@ func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition i
 
 // ProduceMessage 同步发送一条消息。partition < 0 时按 Key 哈希（无 Key 则随机）。
 func (kc *KafkaClient) ProduceMessage(ctx context.Context, topic string, partition int32, key, value []byte, headers map[string]string) (int32, int64, error) {
+	if err := kc.alive(ctx); err != nil {
+		return 0, 0, err
+	}
 	producer, err := kc.getProducer()
 	if err != nil {
 		return 0, 0, err
