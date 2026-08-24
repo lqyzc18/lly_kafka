@@ -3,17 +3,18 @@ package ui
 import (
 	"fmt"
 
+	"lly_kafka/internal/core"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"lly_kafka/internal/core"
 )
 
-// brokersPanel 集群 Broker 列表 Tab。
 type brokersPanel struct {
 	win    fyne.Window
 	client *core.KafkaClient
+	loaded bool
 
 	rows  []core.BrokerInfo
 	table *widget.Table
@@ -50,6 +51,7 @@ func (p *brokersPanel) build() fyne.CanvasObject {
 func (p *brokersPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	label := obj.(*widget.Label)
 	label.TextStyle = fyne.TextStyle{}
+	label.Importance = widget.MediumImportance
 	if id.Row == 0 {
 		label.TextStyle = fyne.TextStyle{Bold: true}
 		switch id.Col {
@@ -67,6 +69,7 @@ func (p *brokersPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) 
 		return
 	}
 	if id.Row-1 >= len(p.rows) {
+		label.SetText("")
 		return
 	}
 	r := p.rows[id.Row-1]
@@ -89,20 +92,32 @@ func (p *brokersPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) 
 	}
 }
 
-// refresh 拉取 Broker 列表（异步）。
+func (p *brokersPanel) ensureLoaded() {
+	if p.loaded {
+		return
+	}
+	p.loaded = true
+	p.refresh()
+}
+
 func (p *brokersPanel) refresh() {
+	if p.info == nil {
+		return
+	}
 	p.info.SetText("刷新中...")
-	go func() {
-		rows, err := p.client.ListBrokers(core.Ctx)
-		fyne.Do(func() {
-			if err != nil {
-				p.info.SetText("获取失败")
-				showError(p.win, "获取 Broker 失败", err)
-				return
-			}
-			p.rows = rows
-			p.info.SetText(fmt.Sprintf("共 %d 个 Broker | 协议版本: %s", len(rows), p.client.KafkaVersion()))
-			p.table.Refresh()
-		})
-	}()
+	fetchAndShow(p.client.Context(), func() ([]core.BrokerInfo, error) {
+		return p.client.ListBrokers(p.client.Context())
+	}, func(rows []core.BrokerInfo, err error) {
+		if p.info == nil || p.table == nil {
+			return
+		}
+		if err != nil {
+			p.info.SetText("获取失败")
+			showError(p.win, "获取 Broker 失败", err)
+			return
+		}
+		p.rows = rows
+		p.info.SetText(fmt.Sprintf("共 %d 个 Broker | 协议版本: %s", len(rows), p.client.KafkaVersion()))
+		p.table.Refresh()
+	})
 }

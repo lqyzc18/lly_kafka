@@ -1,52 +1,83 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strconv"
-	"strings"
+
+	"lly_kafka/internal/core"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"github.com/gogf/gf/v2/util/gconv"
 	"github.com/gogf/gf/v2/os/gtime"
-	"lly_kafka/internal/core"
+	"github.com/gogf/gf/v2/util/gconv"
 )
 
-// messagesPanel 消息浏览与发送 Tab。
+const partAll = "全部"
+
 type messagesPanel struct {
-	win    fyne.Window
-	client *core.KafkaClient
-	cfg    *core.AppConfig
+	win      fyne.Window
+	client   *core.KafkaClient
+	cfg      *core.AppConfig
+	prefs    fyne.Preferences
+	connName string
+	loaded   bool
 
 	topics   []string
 	topicSel *widget.Select
 	partSel  *widget.Select
 
-	mode      *widget.RadioGroup
-	countE    *widget.Entry
-	startE    *widget.Entry
-	endE      *widget.Entry
-	btnFetch  *widget.Button
+	mode       *widget.RadioGroup
+	countE     *widget.Entry
+	startE     *widget.Entry
+	endE       *widget.Entry
+	keyFilter  *widget.Entry
+	valFilter  *widget.Entry
+	btnFetch   *widget.Button
+	btnCancel  *widget.Button
 	btnProduce *widget.Button
-	statusLbl *widget.Label
+	statusLbl  *widget.Label
 
-	table *widget.Table
-	rows  []core.MessageInfo
+	table       *widget.Table
+	allRows     []core.MessageInfo
+	rows        []core.MessageInfo
+	fetchCancel context.CancelFunc
+	restorePart string
 }
 
-// newMessagesPanel 构造消息 Tab。
-func newMessagesPanel(win fyne.Window, client *core.KafkaClient, cfg *core.AppConfig) *messagesPanel {
-	return &messagesPanel{win: win, client: client, cfg: cfg, rows: []core.MessageInfo{}}
+func newMessagesPanel(win fyne.Window, client *core.KafkaClient, cfg *core.AppConfig, prefs fyne.Preferences, connName string) *messagesPanel {
+	return &messagesPanel{
+		win: win, client: client, cfg: cfg, prefs: prefs, connName: connName,
+		rows: []core.MessageInfo{}, allRows: []core.MessageInfo{},
+	}
+}
+
+func (p *messagesPanel) prefKey(kind string) string {
+	return "msg." + kind + "." + p.connName
 }
 
 func (p *messagesPanel) build() fyne.CanvasObject {
-	p.topicSel = widget.NewSelect([]string{}, func(string) {
+	p.topicSel = widget.NewSelect([]string{}, func(s string) {
+		if p.prefs != nil && p.connName != "" && s != "" {
+			p.prefs.SetString(p.prefKey("topic"), s)
+		}
 		p.refreshPartitions()
 	})
-	p.partSel = widget.NewSelect([]string{}, func(string) {})
+	p.partSel = widget.NewSelect([]string{}, func(s string) {
+		if p.prefs != nil && p.connName != "" && s != "" {
+			p.prefs.SetString(p.prefKey("part"), s)
+		}
+	})
+
+	p.countE = widget.NewEntry()
+	p.countE.SetText(strconv.Itoa(p.cfg.DefaultMessageCount))
+	p.startE = widget.NewEntry()
+	p.startE.SetText("0")
+	p.endE = widget.NewEntry()
+	p.endE.SetText("0")
 
 	p.mode = widget.NewRadioGroup([]string{"最新 N 条", "指定 Offset 范围"}, func(string) {
 		p.updateModeFields()
@@ -54,16 +85,16 @@ func (p *messagesPanel) build() fyne.CanvasObject {
 	p.mode.Horizontal = true
 	p.mode.SetSelected("最新 N 条")
 
-	p.countE = widget.NewEntry()
-	p.countE.SetText(strconv.Itoa(p.cfg.DefaultMessageCount))
-	p.startE = widget.NewEntry()
-	p.startE.SetText("0")
-	p.startE.Disable()
-	p.endE = widget.NewEntry()
-	p.endE.SetText("0")
-	p.endE.Disable()
+	p.keyFilter = widget.NewEntry()
+	p.keyFilter.SetPlaceHolder("过滤 Key")
+	p.keyFilter.OnChanged = func(string) { p.applyMsgFilter() }
+	p.valFilter = widget.NewEntry()
+	p.valFilter.SetPlaceHolder("过滤 Value")
+	p.valFilter.OnChanged = func(string) { p.applyMsgFilter() }
 
 	p.btnFetch = widget.NewButtonWithIcon("拉取消息", theme.SearchIcon(), p.onFetch)
+	p.btnCancel = widget.NewButtonWithIcon("取消", theme.CancelIcon(), p.onCancelFetch)
+	p.btnCancel.Disable()
 	p.btnProduce = widget.NewButtonWithIcon("发送消息", theme.MailSendIcon(), p.onProduce)
 	p.statusLbl = widget.NewLabel("就绪")
 	p.statusLbl.Importance = widget.MediumImportance
@@ -101,16 +132,18 @@ func (p *messagesPanel) build() fyne.CanvasObject {
 			widget.NewLabel("起始:"), p.startE,
 			widget.NewLabel("结束:"), p.endE,
 		),
-		container.NewHBox(p.btnFetch, p.btnProduce, p.statusLbl),
+		container.NewGridWithColumns(4,
+			widget.NewLabel("Key 含:"), p.keyFilter,
+			widget.NewLabel("Value 含:"), p.valFilter,
+		),
+		container.NewHBox(p.btnFetch, p.btnCancel, p.btnProduce, p.statusLbl),
 	)
 
 	scroll := container.NewVScroll(p.table)
 	scroll.SetMinSize(fyne.NewSize(600, 400))
-
 	return container.NewBorder(form, nil, nil, nil, scroll)
 }
 
-// updateCell 表格单元格渲染。
 func (p *messagesPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	label := obj.(*widget.Label)
 	label.Importance = widget.MediumImportance
@@ -157,9 +190,11 @@ func (p *messagesPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject)
 	}
 }
 
-// updateModeFields 根据模式启用/禁用输入。
 func (p *messagesPanel) updateModeFields() {
-	if p.mode.Selected == "最新 N 条" {
+	if p.countE == nil || p.startE == nil || p.endE == nil {
+		return
+	}
+	if p.mode != nil && p.mode.Selected == "最新 N 条" {
 		p.countE.Enable()
 		p.startE.Disable()
 		p.endE.Disable()
@@ -170,55 +205,97 @@ func (p *messagesPanel) updateModeFields() {
 	}
 }
 
-// refresh 拉取 Topic 列表并选中第一个。
-func (p *messagesPanel) refresh() {
-	go func() {
-		names, err := p.client.ListTopicNames(core.Ctx)
-		fyne.Do(func() {
-			if err != nil {
-				showError(p.win, "获取 Topic 失败", err)
-				return
-			}
-			p.topics = names
-			p.topicSel.Options = names
-			if len(names) > 0 {
-				p.topicSel.SetSelected(names[0])
-				p.refreshPartitions()
-			} else {
-				p.topicSel.SetSelected("")
-				p.partSel.Options = []string{}
-				p.partSel.SetSelected("")
-			}
-		})
-	}()
+func (p *messagesPanel) ensureLoaded() {
+	if p.loaded {
+		return
+	}
+	p.loaded = true
+	p.refresh()
 }
 
-// refreshPartitions 根据当前 Topic 更新分区选项。
+func (p *messagesPanel) refresh() {
+	fetchAndShow(p.client.Context(), func() ([]string, error) {
+		return p.client.ListTopicNames(p.client.Context())
+	}, func(names []string, err error) {
+		if err != nil {
+			showError(p.win, "获取 Topic 失败", err)
+			return
+		}
+		p.topics = names
+		p.topicSel.Options = names
+		if len(names) == 0 {
+			p.topicSel.SetSelected("")
+			p.partSel.Options = []string{}
+			p.partSel.SetSelected("")
+			return
+		}
+		want := ""
+		if p.prefs != nil {
+			want = p.prefs.String(p.prefKey("topic"))
+		}
+		if want == "" || !contains(names, want) {
+			want = names[0]
+		}
+		if p.prefs != nil {
+			p.restorePart = p.prefs.String(p.prefKey("part"))
+		}
+		p.topicSel.SetSelected(want)
+	})
+}
+
 func (p *messagesPanel) refreshPartitions() {
 	name := p.topicSel.Selected
 	if name == "" {
 		return
 	}
-	go func() {
-		n, err := p.client.PartitionCount(core.Ctx, name)
-		fyne.Do(func() {
-			if err != nil {
-				showError(p.win, "获取分区数失败", err)
-				return
-			}
-			opts := make([]string, n)
-			for i := 0; i < n; i++ {
-				opts[i] = strconv.Itoa(i)
-			}
-			p.partSel.Options = opts
-			if n > 0 {
-				p.partSel.SetSelected(opts[0])
-			}
-		})
-	}()
+	fetchAndShow(p.client.Context(), func() (int, error) {
+		return p.client.PartitionCount(p.client.Context(), name)
+	}, func(n int, err error) {
+		if err != nil {
+			showError(p.win, "获取分区数失败", err)
+			return
+		}
+		if p.topicSel.Selected != name {
+			return
+		}
+		opts := make([]string, 0, n+1)
+		opts = append(opts, partAll)
+		for i := 0; i < n; i++ {
+			opts = append(opts, strconv.Itoa(i))
+		}
+		p.partSel.Options = opts
+		want := p.restorePart
+		p.restorePart = ""
+		if want == "" || !contains(opts, want) {
+			want = partAll
+		}
+		p.partSel.SetSelected(want)
+	})
 }
 
-// onFetch 拉取消息。
+func (p *messagesPanel) applyMsgFilter() {
+	kq, vq := "", ""
+	if p.keyFilter != nil {
+		kq = p.keyFilter.Text
+	}
+	if p.valFilter != nil {
+		vq = p.valFilter.Text
+	}
+	p.rows = core.FilterMessages(p.allRows, kq, vq)
+	if p.table != nil {
+		p.table.Refresh()
+	}
+	if p.statusLbl != nil && len(p.allRows) > 0 {
+		p.statusLbl.SetText(fmt.Sprintf("显示 %d / %d 条", len(p.rows), len(p.allRows)))
+	}
+}
+
+func (p *messagesPanel) onCancelFetch() {
+	if p.fetchCancel != nil {
+		p.fetchCancel()
+	}
+}
+
 func (p *messagesPanel) onFetch() {
 	topic := p.topicSel.Selected
 	partStr := p.partSel.Selected
@@ -226,56 +303,64 @@ func (p *messagesPanel) onFetch() {
 		showInfo(p.win, "提示", "请选择 Topic 和分区")
 		return
 	}
+	allParts := partStr == partAll
 	part := int32(gconv.Int(partStr))
-	var start, end int64
-	if p.mode.Selected == "最新 N 条" {
-		n := int64(gconv.Int(p.countE.Text))
-		if n <= 0 {
-			n = int64(p.cfg.DefaultMessageCount)
-		}
-		hwm, err := p.client.NewestOffset(core.Ctx, topic, part)
-		if err != nil {
-			showError(p.win, "获取最新 offset 失败", err)
-			return
-		}
-		start = hwm - n
-		if start < 0 {
-			start = 0
-		}
-		end = 0
-	} else {
-		start = gconv.Int64(p.startE.Text)
-		end = gconv.Int64(p.endE.Text)
-		if end > 0 && end < start {
-			showInfo(p.win, "提示", "结束 offset 应大于起始 offset")
-			return
-		}
+	latest := p.mode.Selected == "最新 N 条"
+	n := int64(gconv.Int(p.countE.Text))
+	if n <= 0 {
+		n = int64(p.cfg.DefaultMessageCount)
 	}
+	start := gconv.Int64(p.startE.Text)
+	end := gconv.Int64(p.endE.Text)
+	if !latest && end > 0 && end < start {
+		showInfo(p.win, "提示", "结束 offset 应大于或等于起始 offset")
+		return
+	}
+
+	if p.fetchCancel != nil {
+		p.fetchCancel()
+	}
+	fetchCtx, cancel := context.WithCancel(p.client.Context())
+	p.fetchCancel = cancel
+
+	p.btnFetch.Disable()
+	p.btnCancel.Enable()
 	p.statusLbl.SetText("拉取中...")
-	go func() {
-		msgs, err := p.client.FetchMessages(core.Ctx, topic, part, start, end, p.cfg.FetchMaxMessages)
-		fyne.Do(func() {
-			if err != nil {
-				p.statusLbl.SetText("拉取失败")
-				showError(p.win, "拉取消息失败", err)
-				return
+	max := p.cfg.FetchMaxMessages
+	alive := p.client.Context()
+	fetchAndShow(alive, func() ([]core.MessageInfo, error) {
+		if allParts {
+			if latest {
+				return p.client.FetchLatestAll(fetchCtx, topic, int(n), max)
 			}
-			p.rows = msgs
+			return p.client.FetchMessagesAll(fetchCtx, topic, start, end, max)
+		}
+		if latest {
+			return p.client.FetchLatest(fetchCtx, topic, part, int(n), max)
+		}
+		return p.client.FetchMessages(fetchCtx, topic, part, start, end, max)
+	}, func(msgs []core.MessageInfo, err error) {
+		p.btnFetch.Enable()
+		p.btnCancel.Disable()
+		if err != nil {
+			p.statusLbl.SetText("拉取失败")
+			showError(p.win, "拉取消息失败", err)
+			return
+		}
+		p.allRows = msgs
+		p.applyMsgFilter()
+		if len(p.allRows) == len(p.rows) {
 			p.statusLbl.SetText(fmt.Sprintf("共 %d 条消息", len(msgs)))
-			p.table.Refresh()
-		})
-	}()
+		}
+	})
 }
 
-// showMessageDetail 弹窗显示完整消息内容。
 func (p *messagesPanel) showMessageDetail(m core.MessageInfo) {
-	keyE := widget.NewEntry()
-	keyE.SetText(string(m.Key))
-	keyE.MultiLine = true
+	keyE := widget.NewMultiLineEntry()
+	keyE.SetText(core.FormatPayload(m.Key))
 	keyE.Wrapping = fyne.TextWrapWord
-	valE := widget.NewEntry()
-	valE.SetText(string(m.Value))
-	valE.MultiLine = true
+	valE := widget.NewMultiLineEntry()
+	valE.SetText(core.FormatPayload(m.Value))
 	valE.Wrapping = fyne.TextWrapWord
 
 	var hdrStr string
@@ -288,19 +373,20 @@ func (p *messagesPanel) showMessageDetail(m core.MessageInfo) {
 	hdrLbl := widget.NewLabelWithStyle("Headers:\n"+hdrStr, fyne.TextAlignLeading, fyne.TextStyle{})
 	hdrLbl.Wrapping = fyne.TextWrapWord
 
-	content := container.NewVBox(
+	content := container.NewBorder(
 		widget.NewLabelWithStyle(fmt.Sprintf("Topic: %s   分区: %d   Offset: %d   大小: %d",
 			m.Topic, m.Partition, m.Offset, m.Size), fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Key:"), keyE,
-		widget.NewLabel("Value:"), valE,
-		hdrLbl,
+		hdrLbl, nil, nil,
+		container.NewVSplit(
+			container.NewBorder(widget.NewLabel("Key:"), nil, nil, nil, container.NewScroll(keyE)),
+			container.NewBorder(widget.NewLabel("Value（JSON 自动缩进 / 二进制 hex）:"), nil, nil, nil, container.NewScroll(valE)),
+		),
 	)
 	dlg := dialog.NewCustom("消息详情", "关闭", content, p.win)
-	dlg.Resize(fyne.NewSize(700, 500))
+	dlg.Resize(fyne.NewSize(760, 560))
 	dlg.Show()
 }
 
-// onProduce 弹出发送消息对话框。
 func (p *messagesPanel) onProduce() {
 	if len(p.topics) == 0 {
 		showInfo(p.win, "提示", "请先刷新 Topic 列表")
@@ -334,19 +420,18 @@ func (p *messagesPanel) onProduce() {
 			showInfo(p.win, "提示", "请选择 Topic")
 			return
 		}
-		var hdrs map[string]string
-		if raw := strings.TrimSpace(headersE.Text); raw != "" {
-			hdrs = map[string]string{}
-			for _, kv := range strings.Split(raw, ",") {
-				if idx := strings.Index(kv, "="); idx > 0 {
-					hdrs[strings.TrimSpace(kv[:idx])] = strings.TrimSpace(kv[idx+1:])
-				}
-			}
+		hdrs := parseKV(headersE.Text)
+		var key []byte
+		if s := keyE.Text; s != "" {
+			key = []byte(s)
 		}
 		go func() {
-			pid, offset, err := p.client.ProduceMessage(core.Ctx, topic, int32(gconv.Int(partE.Text)),
-				[]byte(keyE.Text), []byte(valE.Text), hdrs)
+			pid, offset, err := p.client.ProduceMessage(p.client.Context(), topic, int32(gconv.Int(partE.Text)),
+				key, []byte(valE.Text), hdrs)
 			fyne.Do(func() {
+				if p.client.Context().Err() != nil {
+					return
+				}
 				if err != nil {
 					showError(p.win, "发送失败", err)
 					return

@@ -1,30 +1,30 @@
 // Package ui 实现 LlyKafka 的 fyne 桌面界面。
-// 该文件提供主题（CJK 字体）、通用对话框与字符串预览工具。
 package ui
 
 import (
+	"context"
 	"fmt"
 	"image/color"
+	"os"
 	"strings"
+
+	"lly_kafka/internal/core"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"github.com/gogf/gf/v2/frame/g"
 	"github.com/gogf/gf/v2/os/gfile"
-	"lly_kafka/internal/core"
 )
 
-// cjkFont 系统探测到的中文字体资源（启动时填充）。
 var cjkFont fyne.Resource
 
-func init() {
-	cjkFont = loadCJKFont()
-}
-
-// loadCJKFont 按平台常见字体路径探测中文字体，使用 gf gfile 简化文件读取。
 func loadCJKFont() fyne.Resource {
-	candidates := []string{
+	candidates := make([]string, 0, 8)
+	if p := strings.TrimSpace(os.Getenv("FYNE_FONT")); p != "" {
+		candidates = append(candidates, p)
+	}
+	candidates = append(candidates,
 		"C:/Windows/Fonts/simhei.ttf",
 		"C:/Windows/Fonts/msyh.ttc",
 		"C:/Windows/Fonts/simsun.ttc",
@@ -32,7 +32,7 @@ func loadCJKFont() fyne.Resource {
 		"/System/Library/Fonts/STHeiti Light.ttc",
 		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 		"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-	}
+	)
 	for _, p := range candidates {
 		if !gfile.Exists(p) {
 			continue
@@ -47,7 +47,22 @@ func loadCJKFont() fyne.Resource {
 	return nil
 }
 
-// cjkTheme 在默认主题上覆盖字体，以支持中文显示。
+func startCJKFontLoader(a fyne.App, refresh func()) {
+	go func() {
+		font := loadCJKFont()
+		if font == nil {
+			return
+		}
+		fyne.Do(func() {
+			cjkFont = font
+			applyCJKTheme(a)
+			if refresh != nil {
+				refresh()
+			}
+		})
+	}()
+}
+
 type cjkTheme struct{ base fyne.Theme }
 
 func (t cjkTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
@@ -66,12 +81,10 @@ func (t cjkTheme) Font(style fyne.TextStyle) fyne.Resource {
 	return t.base.Font(style)
 }
 
-// applyCJKTheme 应用自定义主题（需在 NewWindow 之前调用）。
 func applyCJKTheme(a fyne.App) {
 	a.Settings().SetTheme(cjkTheme{base: theme.DefaultTheme()})
 }
 
-// showError 弹窗并记录日志。
 func showError(w fyne.Window, title string, err error) {
 	if err == nil {
 		return
@@ -80,28 +93,35 @@ func showError(w fyne.Window, title string, err error) {
 	dialog.ShowError(fmt.Errorf("%s: %v", title, err), w)
 }
 
-// showInfo 普通信息提示弹窗。
 func showInfo(w fyne.Window, title, msg string) {
 	dialog.ShowInformation(title, msg, w)
 }
 
-// previewBytes 截取字节数组为可读字符串（用于表格预览）：
-//   - 控制字符替换为转义形式（\n, \t, \r）
-//   - 长度超过 max 则截断并追加 "…"
-//   - nil 字节返回 "null"
+func fetchAndShow[T any](ctx context.Context, load func() (T, error), show func(val T, err error)) {
+	go func() {
+		val, err := load()
+		fyne.Do(func() {
+			if ctx != nil && ctx.Err() != nil {
+				return
+			}
+			show(val, err)
+		})
+	}()
+}
+
 func previewBytes(b []byte, max int) string {
 	if b == nil {
 		return "null"
 	}
-	s := string(b)
-	if max <= 0 || len(s) <= max {
-		max = len(s)
-	} else {
-		s = s[:max] + "…"
-	}
 	var b2 strings.Builder
-	b2.Grow(len(s))
-	for _, r := range s {
+	n := 0
+	truncated := false
+	for _, r := range string(b) {
+		if max > 0 && n >= max {
+			truncated = true
+			break
+		}
+		n++
 		switch r {
 		case '\n':
 			b2.WriteString(`\n`)
@@ -118,6 +138,9 @@ func previewBytes(b []byte, max int) string {
 				b2.WriteRune(r)
 			}
 		}
+	}
+	if truncated {
+		b2.WriteRune('…')
 	}
 	return b2.String()
 }

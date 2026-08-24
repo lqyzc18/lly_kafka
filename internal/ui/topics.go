@@ -2,7 +2,10 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+
+	"lly_kafka/internal/core"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -10,15 +13,13 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/gogf/gf/v2/util/gconv"
-	"github.com/gogf/gf/v2/text/gstr"
-	"lly_kafka/internal/core"
 )
 
 // topicsPanel Topic 列表与详情 Tab。
 type topicsPanel struct {
 	win    fyne.Window
 	client *core.KafkaClient
-	cfg    *core.AppConfig
+	loaded bool
 
 	search    *widget.Entry
 	list      *widget.List
@@ -33,16 +34,18 @@ type topicsPanel struct {
 }
 
 // newTopicsPanel 构造 Topic Tab。
-func newTopicsPanel(win fyne.Window, client *core.KafkaClient, cfg *core.AppConfig) *topicsPanel {
-	return &topicsPanel{win: win, client: client, cfg: cfg, topics: []string{}, filtered: []string{}}
+func newTopicsPanel(win fyne.Window, client *core.KafkaClient) *topicsPanel {
+	return &topicsPanel{win: win, client: client, topics: []string{}, filtered: []string{}}
 }
 
 func (p *topicsPanel) build() fyne.CanvasObject {
 	// 顶部工具条
 	btnRefresh := widget.NewButtonWithIcon("刷新列表", theme.ViewRefreshIcon(), p.refresh)
 	btnCreate := widget.NewButtonWithIcon("新建 Topic", theme.ContentAddIcon(), p.onCreate)
+	btnExpand := widget.NewButtonWithIcon("扩分区", theme.ContentAddIcon(), p.onExpand)
+	btnAlter := widget.NewButtonWithIcon("改配置", theme.DocumentCreateIcon(), p.onAlterConfig)
 	btnDelete := widget.NewButtonWithIcon("删除 Topic", theme.DeleteIcon(), p.onDelete)
-	top := container.NewHBox(btnRefresh, btnCreate, btnDelete)
+	top := container.NewHBox(btnRefresh, btnCreate, btnExpand, btnAlter, btnDelete)
 
 	// 左侧 Topic 列表 + 搜索
 	p.search = widget.NewEntry()
@@ -142,6 +145,7 @@ func (p *topicsPanel) updatePartCell(id widget.TableCellID, obj fyne.CanvasObjec
 		return
 	}
 	part := p.parts[id.Row-1]
+	under := part.UnderReplicated()
 	switch id.Col {
 	case 0:
 		label.SetText(fmt.Sprintf("%d", part.ID))
@@ -150,7 +154,12 @@ func (p *topicsPanel) updatePartCell(id widget.TableCellID, obj fyne.CanvasObjec
 	case 2:
 		label.SetText(formatInts(part.Replicas))
 	case 3:
-		label.SetText(formatInts(part.ISR))
+		if under {
+			label.Importance = widget.DangerImportance
+			label.SetText(formatInts(part.ISR) + " ⚠")
+		} else {
+			label.SetText(formatInts(part.ISR))
+		}
 	case 4:
 		label.SetText(fmt.Sprintf("%d", part.StartOffset))
 	case 5:
@@ -170,33 +179,35 @@ func formatInts(xs []int32) string {
 
 // applyFilter 根据搜索框过滤 Topic。
 func (p *topicsPanel) applyFilter() {
-	q := strings.ToLower(strings.TrimSpace(p.search.Text))
-	if q == "" {
-		p.filtered = p.topics
-		return
+	q := ""
+	if p.search != nil {
+		q = p.search.Text
 	}
-	p.filtered = p.filtered[:0]
-	for _, t := range p.topics {
-		if gstr.ContainsI(t, q) {
-			p.filtered = append(p.filtered, t)
-		}
-	}
+	p.filtered = filterTopics(p.topics, q)
 }
 
-// refresh 拉取 Topic 列表（异步）。
+func (p *topicsPanel) ensureLoaded() {
+	if p.loaded {
+		return
+	}
+	p.loaded = true
+	p.refresh()
+}
+
 func (p *topicsPanel) refresh() {
-	go func() {
-		names, err := p.client.ListTopicNames(core.Ctx)
-		fyne.Do(func() {
-			if err != nil {
-				showError(p.win, "获取 Topic 列表失败", err)
-				return
-			}
-			p.topics = names
-			p.applyFilter()
+	fetchAndShow(p.client.Context(), func() ([]string, error) {
+		return p.client.RefreshTopicNames(p.client.Context())
+	}, func(names []string, err error) {
+		if err != nil {
+			showError(p.win, "获取 Topic 列表失败", err)
+			return
+		}
+		p.topics = names
+		p.applyFilter()
+		if p.list != nil {
 			p.list.Refresh()
-		})
-	}()
+		}
+	})
 }
 
 // onSelect 选择 Topic 后加载详情。
@@ -207,33 +218,55 @@ func (p *topicsPanel) onSelect(name string) {
 
 // refreshDetail 拉取所选 Topic 详情。
 func (p *topicsPanel) refreshDetail() {
-	if p.selected == "" {
+	name := p.selected
+	if name == "" {
 		return
 	}
-	go func() {
-		info, err := p.client.TopicDetail(core.Ctx, p.selected)
-		fyne.Do(func() {
-			if err != nil {
-				p.detailTtl.SetText("加载失败: " + p.selected)
-				p.infoLbl.SetText(err.Error())
-				return
+	fetchAndShow(p.client.Context(), func() (*core.TopicInfo, error) {
+		return p.client.TopicDetail(p.client.Context(), name)
+	}, func(info *core.TopicInfo, err error) {
+		if p.selected != name {
+			return
+		}
+		if err != nil {
+			p.detailTtl.SetText("加载失败: " + name)
+			p.infoLbl.SetText(err.Error())
+			return
+		}
+		p.detailTtl.SetText(info.Name)
+		under := 0
+		var msgs int64
+		for _, part := range info.Partitions {
+			if part.UnderReplicated() {
+				under++
 			}
-			p.detailTtl.SetText(info.Name)
-			p.infoLbl.SetText(fmt.Sprintf("分区数: %d   副本因子: %d", info.NumPartitions, info.ReplicationFactor))
-			p.parts = info.Partitions
-			p.partTable.Refresh()
+			if part.MessageCount > 0 {
+				msgs += part.MessageCount
+			}
+		}
+		extra := ""
+		if under > 0 {
+			extra = fmt.Sprintf("   ⚠ ISR 不足: %d 分区", under)
+		}
+		p.infoLbl.SetText(fmt.Sprintf("分区数: %d   副本因子: %d   约 %d 条消息%s", info.NumPartitions, info.ReplicationFactor, msgs, extra))
+		p.parts = info.Partitions
+		p.partTable.Refresh()
 
-			var cfgs []string
-			for k, v := range info.Configs {
-				cfgs = append(cfgs, fmt.Sprintf("%s = %s", k, v))
-			}
-			if len(cfgs) == 0 {
-				p.cfgLbl.SetText("(无 Topic 配置)")
-			} else {
-				p.cfgLbl.SetText("Topic 配置：\n" + strings.Join(cfgs, "\n"))
-			}
-		})
-	}()
+		keys := make([]string, 0, len(info.Configs))
+		for k := range info.Configs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var cfgs []string
+		for _, k := range keys {
+			cfgs = append(cfgs, fmt.Sprintf("%s = %s", k, info.Configs[k]))
+		}
+		if len(cfgs) == 0 {
+			p.cfgLbl.SetText("(无 Topic 配置)")
+		} else {
+			p.cfgLbl.SetText("Topic 配置：\n" + strings.Join(cfgs, "\n"))
+		}
+	})
 }
 
 // onCreate 弹出「新建 Topic」对话框。
@@ -246,15 +279,12 @@ func (p *topicsPanel) onCreate() {
 	rfE.SetText("1")
 	configsE := widget.NewEntry()
 	configsE.SetPlaceHolder("k1=v1,k2=v2 (可选)")
-	remarkE := widget.NewEntry()
-	remarkE.SetPlaceHolder("备注 (可选，未使用)")
 
 	items := []*widget.FormItem{
 		{Text: "名称", Widget: nameE},
 		{Text: "分区数", Widget: partsE},
 		{Text: "副本因子", Widget: rfE},
 		{Text: "配置", Widget: configsE},
-		{Text: "备注", Widget: remarkE},
 	}
 	d := dialog.NewForm("新建 Topic", "创建", "取消", items, func(ok bool) {
 		if !ok {
@@ -273,18 +303,13 @@ func (p *topicsPanel) onCreate() {
 		if rfN <= 0 {
 			rfN = 1
 		}
-		var cfgs map[string]string
-		if raw := strings.TrimSpace(configsE.Text); raw != "" {
-			cfgs = map[string]string{}
-			for _, kv := range strings.Split(raw, ",") {
-				if idx := strings.Index(kv, "="); idx > 0 {
-					cfgs[strings.TrimSpace(kv[:idx])] = strings.TrimSpace(kv[idx+1:])
-				}
-			}
-		}
+		cfgs := parseKV(strings.TrimSpace(configsE.Text))
 		go func() {
-			err := p.client.CreateTopic(core.Ctx, name, partsN, rfN, cfgs)
+			err := p.client.CreateTopic(p.client.Context(), name, partsN, rfN, cfgs)
 			fyne.Do(func() {
+				if p.client.Context().Err() != nil {
+					return
+				}
 				if err != nil {
 					showError(p.win, "创建 Topic 失败", err)
 					return
@@ -305,13 +330,18 @@ func (p *topicsPanel) onDelete() {
 		return
 	}
 	name := p.selected
-	dialog.ShowConfirm("确认删除", "确定要删除 Topic 「"+name+"」吗？", func(ok bool) {
+	n := len(p.parts)
+	msg := fmt.Sprintf("确定删除 Topic「%s」吗？\n分区数: %d\n此操作不可恢复。", name, n)
+	dialog.ShowConfirm("确认删除", msg, func(ok bool) {
 		if !ok {
 			return
 		}
 		go func() {
-			err := p.client.DeleteTopic(core.Ctx, name)
+			err := p.client.DeleteTopic(p.client.Context(), name)
 			fyne.Do(func() {
+				if p.client.Context().Err() != nil {
+					return
+				}
 				if err != nil {
 					showError(p.win, "删除失败", err)
 					return
@@ -322,4 +352,86 @@ func (p *topicsPanel) onDelete() {
 			})
 		}()
 	}, p.win)
+}
+
+func (p *topicsPanel) onExpand() {
+	if p.selected == "" {
+		showInfo(p.win, "提示", "请先选择 Topic")
+		return
+	}
+	cur := int32(len(p.parts))
+	if cur == 0 {
+		cur = 1
+	}
+	countE := widget.NewEntry()
+	countE.SetText(fmt.Sprintf("%d", cur+1))
+	items := []*widget.FormItem{
+		{Text: "目标分区数", Widget: countE},
+	}
+	name := p.selected
+	d := dialog.NewForm("扩容分区 - "+name, "扩容", "取消", items, func(ok bool) {
+		if !ok {
+			return
+		}
+		n := gconv.Int32(strings.TrimSpace(countE.Text))
+		if n <= cur {
+			showInfo(p.win, "提示", fmt.Sprintf("目标分区数必须大于当前 %d", cur))
+			return
+		}
+		go func() {
+			err := p.client.ExpandPartitions(p.client.Context(), name, n)
+			fyne.Do(func() {
+				if p.client.Context().Err() != nil {
+					return
+				}
+				if err != nil {
+					showError(p.win, "扩容失败", err)
+					return
+				}
+				showInfo(p.win, "成功", fmt.Sprintf("已将 %s 扩至 %d 分区", name, n))
+				p.refreshDetail()
+			})
+		}()
+	}, p.win)
+	d.Resize(fyne.NewSize(400, 180))
+	d.Show()
+}
+
+func (p *topicsPanel) onAlterConfig() {
+	if p.selected == "" {
+		showInfo(p.win, "提示", "请先选择 Topic")
+		return
+	}
+	cfgE := widget.NewEntry()
+	cfgE.SetPlaceHolder("retention.ms=86400000,cleanup.policy=delete")
+	items := []*widget.FormItem{
+		{Text: "配置", Widget: cfgE},
+	}
+	name := p.selected
+	d := dialog.NewForm("修改 Topic 配置 - "+name, "提交", "取消", items, func(ok bool) {
+		if !ok {
+			return
+		}
+		cfgs := parseKV(cfgE.Text)
+		if len(cfgs) == 0 {
+			showInfo(p.win, "提示", "请填写 k=v 配置")
+			return
+		}
+		go func() {
+			err := p.client.AlterTopicConfig(p.client.Context(), name, cfgs)
+			fyne.Do(func() {
+				if p.client.Context().Err() != nil {
+					return
+				}
+				if err != nil {
+					showError(p.win, "修改配置失败", err)
+					return
+				}
+				showInfo(p.win, "成功", "已提交配置修改")
+				p.refreshDetail()
+			})
+		}()
+	}, p.win)
+	d.Resize(fyne.NewSize(480, 200))
+	d.Show()
 }

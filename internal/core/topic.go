@@ -32,8 +32,23 @@ type TopicInfo struct {
 	Partitions        []PartitionInfo
 }
 
-// ListTopicNames 返回全部用户 Topic 名称（过滤内部 topic）。
+// ListTopicNames 返回用户 Topic 名称（带缓存）。
 func (kc *KafkaClient) ListTopicNames(ctx context.Context) ([]string, error) {
+	kc.topicMu.RLock()
+	if len(kc.topicNames) > 0 {
+		out := append([]string(nil), kc.topicNames...)
+		kc.topicMu.RUnlock()
+		return out, nil
+	}
+	kc.topicMu.RUnlock()
+	return kc.RefreshTopicNames(ctx)
+}
+
+// RefreshTopicNames 强制刷新 Topic 列表并更新缓存。
+func (kc *KafkaClient) RefreshTopicNames(ctx context.Context) ([]string, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
 	details, err := kc.admin.ListTopics()
 	if err != nil {
 		return nil, err
@@ -46,11 +61,17 @@ func (kc *KafkaClient) ListTopicNames(ctx context.Context) ([]string, error) {
 		out = append(out, name)
 	}
 	sort.Strings(out)
+	kc.topicMu.Lock()
+	kc.topicNames = append([]string(nil), out...)
+	kc.topicMu.Unlock()
 	return out, nil
 }
 
 // TopicDetail 返回 Topic 的详细信息（含各分区的 Leader/ISR/Offset 等）。
 func (kc *KafkaClient) TopicDetail(ctx context.Context, name string) (*TopicInfo, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
 	metas, err := kc.admin.DescribeTopics([]string{name})
 	if err != nil {
 		return nil, err
@@ -69,13 +90,21 @@ func (kc *KafkaClient) TopicDetail(ctx context.Context, name string) (*TopicInfo
 	}
 	info.NumPartitions = int32(len(meta.Partitions))
 
-	for _, p := range meta.Partitions {
+	info.Partitions = make([]PartitionInfo, len(meta.Partitions))
+	runBounded(len(meta.Partitions), defaultConcurrency, func(i int) {
+		if ctxErr(ctx) != nil {
+			return
+		}
+		p := meta.Partitions[i]
 		pi := PartitionInfo{
-			ID:       p.ID,
-			Leader:   p.Leader,
-			Replicas: p.Replicas,
-			ISR:      p.Isr,
-			Offline:  p.OfflineReplicas,
+			ID:           p.ID,
+			Leader:       p.Leader,
+			Replicas:     p.Replicas,
+			ISR:          p.Isr,
+			Offline:      p.OfflineReplicas,
+			StartOffset:  -1,
+			EndOffset:    -1,
+			MessageCount: 0,
 		}
 		if start, err := kc.client.GetOffset(name, p.ID, sarama.OffsetOldest); err == nil {
 			pi.StartOffset = start
@@ -86,7 +115,10 @@ func (kc *KafkaClient) TopicDetail(ctx context.Context, name string) (*TopicInfo
 		if pi.StartOffset >= 0 && pi.EndOffset >= pi.StartOffset {
 			pi.MessageCount = pi.EndOffset - pi.StartOffset
 		}
-		info.Partitions = append(info.Partitions, pi)
+		info.Partitions[i] = pi
+	})
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
 	}
 	sort.Slice(info.Partitions, func(i, j int) bool { return info.Partitions[i].ID < info.Partitions[j].ID })
 
@@ -124,6 +156,7 @@ func (kc *KafkaClient) CreateTopic(ctx context.Context, name string, partitions 
 	if err := kc.admin.CreateTopic(name, detail, false); err != nil {
 		return err
 	}
+	kc.invalidateTopics()
 	g.Log().Infof(ctx, "创建 Topic: %s (partitions=%d, replication=%d)", name, partitions, replication)
 	return nil
 }
@@ -136,8 +169,44 @@ func (kc *KafkaClient) DeleteTopic(ctx context.Context, name string) error {
 	if err := kc.admin.DeleteTopic(name); err != nil {
 		return err
 	}
+	kc.invalidateTopics()
 	g.Log().Infof(ctx, "删除 Topic: %s", name)
 	return nil
+}
+
+// ExpandPartitions 将 Topic 分区数扩容到 count（只能增加）。
+func (kc *KafkaClient) ExpandPartitions(ctx context.Context, name string, count int32) error {
+	if count <= 0 {
+		return errors.New("分区数必须大于 0")
+	}
+	if err := kc.admin.CreatePartitions(name, count, nil, false); err != nil {
+		return err
+	}
+	kc.invalidateTopics()
+	g.Log().Infof(ctx, "扩容 Topic %s 分区数到 %d", name, count)
+	return nil
+}
+
+// AlterTopicConfig 增量修改 Topic 配置。
+func (kc *KafkaClient) AlterTopicConfig(ctx context.Context, name string, configs map[string]string) error {
+	if len(configs) == 0 {
+		return errors.New("配置不能为空")
+	}
+	entries := make(map[string]*string, len(configs))
+	for k, v := range configs {
+		vv := v
+		entries[k] = &vv
+	}
+	if err := kc.admin.AlterConfig(sarama.TopicResource, name, entries, false); err != nil {
+		return err
+	}
+	g.Log().Infof(ctx, "修改 Topic 配置: %s", name)
+	return nil
+}
+
+// UnderReplicated 表示 ISR 少于副本或存在离线副本。
+func (p PartitionInfo) UnderReplicated() bool {
+	return len(p.ISR) < len(p.Replicas) || len(p.Offline) > 0
 }
 
 // PartitionCount 快速获取 Topic 的分区数。

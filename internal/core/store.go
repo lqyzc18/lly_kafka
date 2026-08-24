@@ -10,11 +10,36 @@ import (
 
 // Connection 一个 Kafka 集群连接配置
 type Connection struct {
-	Name     string `json:"name"`     // 连接名称
-	Brokers  string `json:"brokers"`  // broker 地址，逗号分隔 host:port
-	Version  string `json:"version"`  // Kafka 版本，如 3.6.0
-	ClientID string `json:"clientId"` // 客户端 ID
-	Remark   string `json:"remark"`   // 备注
+	Name     string `json:"name"`
+	Brokers  string `json:"brokers"`
+	Version  string `json:"version"`
+	ClientID string `json:"clientId"`
+	Remark   string `json:"remark"`
+
+	Security      string `json:"security,omitempty"`
+	SASLMechanism string `json:"saslMechanism,omitempty"`
+	SASLUsername  string `json:"saslUsername,omitempty"`
+	SASLPassword  string `json:"saslPassword,omitempty"`
+	TLSInsecure   bool   `json:"tlsInsecure,omitempty"`
+	TLSCAFile     string `json:"tlsCaFile,omitempty"`
+	TLSCertFile   string `json:"tlsCertFile,omitempty"`
+	TLSKeyFile    string `json:"tlsKeyFile,omitempty"`
+}
+
+func cloneConn(c *Connection) *Connection {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	return &cp
+}
+
+func cloneConns(in []*Connection) []*Connection {
+	out := make([]*Connection, len(in))
+	for i, c := range in {
+		out[i] = cloneConn(c)
+	}
+	return out
 }
 
 // ConnectionStore 连接配置的本地持久化存储。
@@ -34,7 +59,6 @@ func NewConnectionStore(file string) (*ConnectionStore, error) {
 		if err != nil {
 			return nil, err
 		}
-		// gjson.Scan 支持直接将 JSON 解析到切片指针
 		if err := j.Scan(&s.conns); err != nil {
 			return nil, err
 		}
@@ -46,9 +70,7 @@ func NewConnectionStore(file string) (*ConnectionStore, error) {
 func (s *ConnectionStore) List() []*Connection {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*Connection, len(s.conns))
-	copy(out, s.conns)
-	return out
+	return cloneConns(s.conns)
 }
 
 // Names 返回全部连接名称。
@@ -62,13 +84,13 @@ func (s *ConnectionStore) Names() []string {
 	return out
 }
 
-// Get 按名称获取连接。
+// Get 按名称获取连接（副本）。
 func (s *ConnectionStore) Get(name string) *Connection {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, c := range s.conns {
 		if c.Name == name {
-			return c
+			return cloneConn(c)
 		}
 	}
 	return nil
@@ -76,15 +98,19 @@ func (s *ConnectionStore) Get(name string) *Connection {
 
 // Upsert 新增或更新连接并持久化（按 Name 匹配）。
 func (s *ConnectionStore) Upsert(c *Connection) error {
+	if c == nil {
+		return nil
+	}
+	cp := cloneConn(c)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, old := range s.conns {
-		if old.Name == c.Name {
-			s.conns[i] = c
+		if old.Name == cp.Name {
+			s.conns[i] = cp
 			return s.saveLocked()
 		}
 	}
-	s.conns = append(s.conns, c)
+	s.conns = append(s.conns, cp)
 	return s.saveLocked()
 }
 
@@ -92,7 +118,7 @@ func (s *ConnectionStore) Upsert(c *Connection) error {
 func (s *ConnectionStore) Remove(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := s.conns[:0]
+	out := make([]*Connection, 0, len(s.conns))
 	for _, c := range s.conns {
 		if c.Name != name {
 			out = append(out, c)

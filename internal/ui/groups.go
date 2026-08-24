@@ -3,21 +3,25 @@ package ui
 import (
 	"fmt"
 
+	"lly_kafka/internal/core"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"lly_kafka/internal/core"
 )
 
-// groupsPanel 消费组 Tab。
 type groupsPanel struct {
 	win    fyne.Window
 	client *core.KafkaClient
+	loaded bool
 
-	groups  []core.GroupInfo
-	list    *widget.List
-	selected string
+	allGroups []core.GroupInfo
+	groups    []core.GroupInfo
+	search    *widget.Entry
+	list      *widget.List
+	selected  string
 
 	infoHead *widget.Label
 	table    *widget.Table
@@ -30,7 +34,17 @@ func newGroupsPanel(win fyne.Window, client *core.KafkaClient) *groupsPanel {
 
 func (p *groupsPanel) build() fyne.CanvasObject {
 	btn := widget.NewButtonWithIcon("刷新", theme.ViewRefreshIcon(), p.refresh)
-	head := container.NewHBox(btn)
+	btnLatest := widget.NewButton("重置到最新", func() { p.onReset(core.OffsetResetLatest) })
+	btnEarliest := widget.NewButton("重置到最早", func() { p.onReset(core.OffsetResetEarliest) })
+	p.search = widget.NewEntry()
+	p.search.SetPlaceHolder("搜索消费组...")
+	p.search.OnChanged = func(string) {
+		p.applyFilter()
+		if p.list != nil {
+			p.list.Refresh()
+		}
+	}
+	head := container.NewVBox(container.NewHBox(btn, btnLatest, btnEarliest), p.search)
 
 	p.list = widget.NewList(
 		func() int { return len(p.groups) },
@@ -58,6 +72,7 @@ func (p *groupsPanel) build() fyne.CanvasObject {
 	left := container.NewBorder(head, nil, nil, nil, p.list)
 
 	p.infoHead = widget.NewLabelWithStyle("请选择消费组", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	p.infoHead.Wrapping = fyne.TextWrapWord
 	p.table = widget.NewTable(
 		func() (int, int) { return len(p.rows) + 1, 5 },
 		func() fyne.CanvasObject {
@@ -77,8 +92,35 @@ func (p *groupsPanel) build() fyne.CanvasObject {
 		container.NewVScroll(p.table))
 
 	split := container.NewHSplit(left, right)
-	split.Offset = 0.28
+	split.Offset = 0.32
 	return split
+}
+
+func (p *groupsPanel) applyFilter() {
+	q := ""
+	if p.search != nil {
+		q = p.search.Text
+	}
+	if q == "" {
+		p.groups = append([]core.GroupInfo(nil), p.allGroups...)
+		return
+	}
+	names := make([]string, len(p.allGroups))
+	for i, g := range p.allGroups {
+		names[i] = g.Name
+	}
+	keep := filterTopics(names, q)
+	set := map[string]struct{}{}
+	for _, n := range keep {
+		set[n] = struct{}{}
+	}
+	out := make([]core.GroupInfo, 0, len(keep))
+	for _, g := range p.allGroups {
+		if _, ok := set[g.Name]; ok {
+			out = append(out, g)
+		}
+	}
+	p.groups = out
 }
 
 func (p *groupsPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
@@ -124,37 +166,81 @@ func (p *groupsPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	}
 }
 
-// refresh 拉取消费组列表。
-func (p *groupsPanel) refresh() {
-	go func() {
-		groups, err := p.client.ListGroups(core.Ctx)
-		fyne.Do(func() {
-			if err != nil {
-				showError(p.win, "获取消费组失败", err)
-				return
-			}
-			p.groups = groups
-			p.list.Refresh()
-		})
-	}()
+func (p *groupsPanel) ensureLoaded() {
+	if p.loaded {
+		return
+	}
+	p.loaded = true
+	p.refresh()
 }
 
-// refreshOffsets 拉取所选消费组的 offset 与 lag。
+func (p *groupsPanel) refresh() {
+	fetchAndShow(p.client.Context(), func() ([]core.GroupInfo, error) {
+		return p.client.ListGroups(p.client.Context())
+	}, func(groups []core.GroupInfo, err error) {
+		if err != nil {
+			showError(p.win, "获取消费组失败", err)
+			return
+		}
+		p.allGroups = groups
+		p.applyFilter()
+		if p.list != nil {
+			p.list.Refresh()
+		}
+	})
+}
+
 func (p *groupsPanel) refreshOffsets() {
+	group := p.selected
+	if group == "" {
+		return
+	}
+	fetchAndShow(p.client.Context(), func() ([]core.GroupTopicOffset, error) {
+		return p.client.GroupOffsets(p.client.Context(), group)
+	}, func(rows []core.GroupTopicOffset, err error) {
+		if p.selected != group {
+			return
+		}
+		if err != nil {
+			p.infoHead.SetText(group + " (加载失败: " + err.Error() + ")")
+			return
+		}
+		p.rows = rows
+		total, n := core.GroupLagSummary(rows)
+		p.infoHead.SetText(fmt.Sprintf("消费组: %s  ·  %d 个分区  ·  总 Lag %d  ·  %d 个分区落后", group, len(rows), total, n))
+		p.table.Refresh()
+	})
+}
+
+func (p *groupsPanel) onReset(to string) {
 	if p.selected == "" {
+		showInfo(p.win, "提示", "请先选择消费组")
 		return
 	}
 	group := p.selected
-	go func() {
-		rows, err := p.client.GroupOffsets(core.Ctx, group)
-		fyne.Do(func() {
-			if err != nil {
-				p.infoHead.SetText(group + " (加载失败: " + err.Error() + ")")
+	label := "最新"
+	if to == core.OffsetResetEarliest {
+		label = "最早"
+	}
+	dialog.ShowConfirm("重置 Offset",
+		fmt.Sprintf("将消费组「%s」的全部已提交分区重置到%s offset。\n进行中的消费者可能报错并 rebalance，确定继续？", group, label),
+		func(ok bool) {
+			if !ok {
 				return
 			}
-			p.infoHead.SetText(fmt.Sprintf("消费组: %s  ·  %d 个分区", group, len(rows)))
-			p.rows = rows
-			p.table.Refresh()
-		})
-	}()
+			go func() {
+				err := p.client.ResetGroupOffsets(p.client.Context(), group, to)
+				fyne.Do(func() {
+					if p.client.Context().Err() != nil {
+						return
+					}
+					if err != nil {
+						showError(p.win, "重置失败", err)
+						return
+					}
+					showInfo(p.win, "成功", "已重置消费组: "+group)
+					p.refreshOffsets()
+				})
+			}()
+		}, p.win)
 }

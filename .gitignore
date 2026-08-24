@@ -1,13 +1,16 @@
 # 编译产物
+/bin/
 /lly_kafka
 /lly_kafka.exe
 /lly_kafka.app
 /build/
 /dist/
+*.exe
 
 # 数据与日志
 /data/
 /logs/
+**/logs/
 
 # Go
 /vendor/

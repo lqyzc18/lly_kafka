@@ -29,6 +29,6 @@ func LoadAppConfig(ctx context.Context) (*AppConfig, error) {
 		FetchMaxMessages:    gconv.Int(cfg.MustGet(ctx, "app.fetch_max_messages", 500)),
 		DefaultMessageCount: gconv.Int(cfg.MustGet(ctx, "app.default_message_count", 50)),
 		MessagePreviewLen:   gconv.Int(cfg.MustGet(ctx, "app.message_preview_len", 200)),
-		ConnectionsFile:     gconv.String(cfg.MustGet(ctx, "store.connections_file", "data/connections.json")),
+		ConnectionsFile:     AbsPath(gconv.String(cfg.MustGet(ctx, "store.connections_file", "data/connections.json"))),
 	}, nil
 }
