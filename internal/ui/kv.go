@@ -4,23 +4,66 @@ import (
 	"strings"
 )
 
+// parseKV 解析配置或 Header 键值对。
+// 支持以下格式：
+// 1. 多行模式（包含换行符）：每行一个 key=val 或 key: val（value 内可包含逗号）
+// 2. 单行逗号分隔模式：key1=val1,key2=val2 或 key1: val1, key2: val2
 func parseKV(raw string) map[string]string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
 	}
-	out := map[string]string{}
-	for _, kv := range strings.Split(raw, ",") {
-		idx := strings.Index(kv, "=")
-		if idx <= 0 {
-			continue
+
+	parsePair := func(line string) (string, string, bool) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			return "", "", false
 		}
-		k := strings.TrimSpace(kv[:idx])
+		eqIdx := strings.Index(line, "=")
+		colonIdx := strings.Index(line, ":")
+
+		splitIdx := -1
+		sepLen := 1
+		if eqIdx > 0 && colonIdx > 0 {
+			if eqIdx < colonIdx {
+				splitIdx = eqIdx
+			} else {
+				splitIdx = colonIdx
+			}
+		} else if eqIdx > 0 {
+			splitIdx = eqIdx
+		} else if colonIdx > 0 {
+			splitIdx = colonIdx
+		}
+
+		if splitIdx <= 0 {
+			return "", "", false
+		}
+		k := strings.TrimSpace(line[:splitIdx])
+		v := strings.TrimSpace(line[splitIdx+sepLen:])
 		if k == "" {
-			continue
+			return "", "", false
 		}
-		out[k] = strings.TrimSpace(kv[idx+1:])
+		return k, v, true
 	}
+
+	out := make(map[string]string)
+	if strings.Contains(raw, "\n") {
+		lines := strings.Split(raw, "\n")
+		for _, line := range lines {
+			line = strings.TrimRight(line, "\r")
+			if k, v, ok := parsePair(line); ok {
+				out[k] = v
+			}
+		}
+	} else {
+		for _, part := range strings.Split(raw, ",") {
+			if k, v, ok := parsePair(part); ok {
+				out[k] = v
+			}
+		}
+	}
+
 	if len(out) == 0 {
 		return nil
 	}

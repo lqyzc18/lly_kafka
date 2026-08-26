@@ -49,6 +49,32 @@ func (kc *KafkaClient) OldestOffset(ctx context.Context, topic string, partition
 	return kc.client.GetOffset(topic, partition, sarama.OffsetOldest)
 }
 
+// GetOffsetByTime 根据时间戳定位分区的起始 Offset。
+// 如果指定时间早于最旧数据，返回 OldestOffset；若晚于最新数据，返回 NewestOffset。
+func (kc *KafkaClient) GetOffsetByTime(ctx context.Context, topic string, partition int32, t time.Time) (int64, error) {
+	if err := kc.alive(ctx); err != nil {
+		return 0, err
+	}
+	oldest, hwm, err := kc.oldestAndNewest(ctx, topic, partition)
+	if err != nil {
+		return 0, err
+	}
+	if t.IsZero() {
+		return oldest, nil
+	}
+	off, err := kc.client.GetOffset(topic, partition, t.UnixMilli())
+	if err != nil {
+		return 0, err
+	}
+	if off < 0 || off > hwm {
+		return hwm, nil
+	}
+	if off < oldest {
+		return oldest, nil
+	}
+	return off, nil
+}
+
 func (kc *KafkaClient) oldestAndNewest(ctx context.Context, topic string, partition int32) (oldest, hwm int64, err error) {
 	if err := kc.alive(ctx); err != nil {
 		return 0, 0, err
@@ -90,6 +116,76 @@ func (kc *KafkaClient) FetchLatest(ctx context.Context, topic string, partition 
 	return kc.fetchRange(ctx, topic, partition, oldest, hwm, start, 0, max)
 }
 
+// FetchByTime 根据起始时间拉取指定分区的消息。
+func (kc *KafkaClient) FetchByTime(ctx context.Context, topic string, partition int32, startTime time.Time, max int) ([]MessageInfo, error) {
+	if ctx == nil {
+		ctx = kc.Context()
+	}
+	startOffset, err := kc.GetOffsetByTime(ctx, topic, partition, startTime)
+	if err != nil {
+		return nil, err
+	}
+	return kc.FetchMessages(ctx, topic, partition, startOffset, 0, max)
+}
+
+// FetchByTimeAll 根据起始时间拉取该 Topic 所有分区的消息（合计不超过 max）。
+func (kc *KafkaClient) FetchByTimeAll(ctx context.Context, topic string, startTime time.Time, max int) ([]MessageInfo, error) {
+	if ctx == nil {
+		ctx = kc.Context()
+	}
+	count, err := kc.PartitionCount(ctx, topic)
+	if err != nil {
+		return nil, err
+	}
+	if count <= 0 {
+		return []MessageInfo{}, nil
+	}
+	if max <= 0 {
+		max = defaultFetchMax
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	per := max / count
+	if per < 1 {
+		per = 1
+	}
+
+	type partResult struct {
+		msgs []MessageInfo
+		err  error
+	}
+	results := make([]partResult, count)
+	runBounded(count, 8, func(i int) {
+		if ctxErr(ctx) != nil {
+			return
+		}
+		msgs, e := kc.FetchByTime(ctx, topic, int32(i), startTime, per)
+		results[i] = partResult{msgs: msgs, err: e}
+	})
+
+	var all []MessageInfo
+	var errs []error
+	for _, r := range results {
+		all = append(all, r.msgs...)
+		if r.err != nil {
+			errs = append(errs, r.err)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if !all[i].Timestamp.Equal(all[j].Timestamp) {
+			return all[i].Timestamp.After(all[j].Timestamp)
+		}
+		if all[i].Partition != all[j].Partition {
+			return all[i].Partition < all[j].Partition
+		}
+		return all[i].Offset > all[j].Offset
+	})
+	if len(all) > max {
+		all = all[:max]
+	}
+	return all, errors.Join(errs...)
+}
+
 // FetchMessages 拉取指定分区的消息。
 //   - start: 起始 offset（包含）
 //   - end:   结束 offset（包含）；<=0 时表示读到最新
@@ -107,7 +203,7 @@ func (kc *KafkaClient) FetchMessages(ctx context.Context, topic string, partitio
 
 const AllPartitions int32 = -1
 
-// FetchLatest 在 partition == AllPartitions 时拉取该 Topic 全部分区的最新 n 条（合计不超过 max）。
+// FetchLatestAll 在 partition == AllPartitions 时拉取该 Topic 全部分区的最新 n 条（合计不超过 max）。
 func (kc *KafkaClient) FetchLatestAll(ctx context.Context, topic string, n, max int) ([]MessageInfo, error) {
 	if ctx == nil {
 		ctx = kc.Context()
@@ -214,6 +310,79 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 		all = all[:max]
 	}
 	return all, errors.Join(errs...)
+}
+
+// StartLiveTail 启动实时消息监听，从最新消息（HWM）开始持续消费新到达的消息并发送到 msgCh。
+func (kc *KafkaClient) StartLiveTail(ctx context.Context, topic string, partition int32, msgCh chan<- MessageInfo, errCh chan<- error) error {
+	if err := kc.alive(ctx); err != nil {
+		return err
+	}
+	consumer, err := kc.getConsumer()
+	if err != nil {
+		return err
+	}
+
+	var partitions []int32
+	if partition == AllPartitions {
+		count, err := kc.PartitionCount(ctx, topic)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < count; i++ {
+			partitions = append(partitions, int32(i))
+		}
+	} else {
+		partitions = []int32{partition}
+	}
+
+	if len(partitions) == 0 {
+		return errors.New("无可用分区")
+	}
+
+	for _, p := range partitions {
+		p := p
+		if err := kc.beginFetch(ctx); err != nil {
+			return err
+		}
+		go func() {
+			defer kc.fetches.Done()
+			pc, err := consumer.ConsumePartition(topic, p, sarama.OffsetNewest)
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("分区 %d 监听启动失败: %w", p, err):
+				case <-ctx.Done():
+				}
+				return
+			}
+			defer pc.Close()
+
+			for {
+				select {
+				case m, ok := <-pc.Messages():
+					if !ok {
+						return
+					}
+					select {
+					case msgCh <- toMessageInfo(m):
+					case <-ctx.Done():
+						return
+					}
+				case e, ok := <-pc.Errors():
+					if !ok || e == nil {
+						continue
+					}
+					select {
+					case errCh <- e.Err:
+					case <-ctx.Done():
+						return
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	return nil
 }
 
 func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition int32, oldest, hwm, start, end int64, max int) ([]MessageInfo, error) {

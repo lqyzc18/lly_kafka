@@ -19,6 +19,35 @@ func TestFormatPayloadHex(t *testing.T) {
 	}
 }
 
+func TestFormatModes(t *testing.T) {
+	rawJSON := []byte(`{"name":"test","count":42}`)
+	jsonStr, ok := FormatJSON(rawJSON)
+	if !ok || !strings.Contains(jsonStr, "\n") || !strings.Contains(jsonStr, `"name"`) {
+		t.Fatalf("FormatJSON failed: %q", jsonStr)
+	}
+
+	invalidJSON := []byte(`not-a-json`)
+	_, ok = FormatJSON(invalidJSON)
+	if ok {
+		t.Fatalf("FormatJSON should return false for invalid json")
+	}
+
+	raw := FormatRaw([]byte("hello world"))
+	if raw != "hello world" {
+		t.Fatalf("FormatRaw failed: %q", raw)
+	}
+
+	hexStr := FormatHex([]byte{0xde, 0xad, 0xbe, 0xef})
+	if !strings.Contains(hexStr, "deadbeef") && !strings.Contains(hexStr, "de ad be ef") {
+		t.Fatalf("FormatHex failed: %q", hexStr)
+	}
+
+	b64Str := FormatBase64([]byte("hello"))
+	if b64Str != "aGVsbG8=" {
+		t.Fatalf("FormatBase64 failed: %q", b64Str)
+	}
+}
+
 func TestFilterMessages(t *testing.T) {
 	msgs := []MessageInfo{
 		{Key: []byte("user-1"), Value: []byte("hello")},

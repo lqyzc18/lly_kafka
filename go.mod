@@ -6,6 +6,7 @@ require (
 	fyne.io/fyne/v2 v2.8.0
 	github.com/IBM/sarama v1.60.2
 	github.com/gogf/gf/v2 v2.10.2
+	github.com/xdg-go/scram v1.2.0
 )
 
 require (
@@ -63,7 +64,6 @@ require (
 	github.com/srwiley/rasterx v0.0.0-20220730225603-2ab79fcdd4ef // indirect
 	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
-	github.com/xdg-go/scram v1.2.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
