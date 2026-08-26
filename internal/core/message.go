@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,33 @@ import (
 )
 
 const defaultFetchTimeout = 8 * time.Second
+
+// PartitionError 记录单个分区拉取失败的信息。
+type PartitionError struct {
+	Partition int32
+	Err       error
+}
+
+func (e PartitionError) Error() string {
+	return fmt.Sprintf("分区 %d: %v", e.Partition, e.Err)
+}
+
+// PartitionErrors 聚合多个分区错误，便于 UI 层展示部分失败详情。
+type PartitionErrors struct {
+	Total   int
+	Failures []PartitionError
+}
+
+func (es PartitionErrors) Error() string {
+	if len(es.Failures) == 0 {
+		return ""
+	}
+	parts := make([]string, len(es.Failures))
+	for i, e := range es.Failures {
+		parts[i] = e.Error()
+	}
+	return fmt.Sprintf("部分分区拉取失败 (%d/%d): %s", len(es.Failures), es.Total, strings.Join(parts, "; "))
+}
 
 // HeaderInfo 消息 Header
 type HeaderInfo struct {
@@ -164,11 +192,12 @@ func (kc *KafkaClient) FetchByTimeAll(ctx context.Context, topic string, startTi
 	})
 
 	var all []MessageInfo
-	var errs []error
-	for _, r := range results {
+	var partErrs PartitionErrors
+	partErrs.Total = count
+	for i, r := range results {
 		all = append(all, r.msgs...)
 		if r.err != nil {
-			errs = append(errs, r.err)
+			partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: int32(i), Err: r.err})
 		}
 	}
 	sort.Slice(all, func(i, j int) bool {
@@ -183,7 +212,10 @@ func (kc *KafkaClient) FetchByTimeAll(ctx context.Context, topic string, startTi
 	if len(all) > max {
 		all = all[:max]
 	}
-	return all, errors.Join(errs...)
+	if len(partErrs.Failures) > 0 {
+		return all, partErrs
+	}
+	return all, nil
 }
 
 // FetchMessages 拉取指定分区的消息。
@@ -237,11 +269,12 @@ func (kc *KafkaClient) FetchLatestAll(ctx context.Context, topic string, n, max 
 		results[i] = partResult{msgs: msgs, err: e}
 	})
 	var all []MessageInfo
-	var errs []error
-	for _, r := range results {
+	var partErrs PartitionErrors
+	partErrs.Total = count
+	for i, r := range results {
 		all = append(all, r.msgs...)
 		if r.err != nil {
-			errs = append(errs, r.err)
+			partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: int32(i), Err: r.err})
 		}
 	}
 	sort.Slice(all, func(i, j int) bool {
@@ -256,7 +289,10 @@ func (kc *KafkaClient) FetchLatestAll(ctx context.Context, topic string, n, max 
 	if len(all) > max {
 		all = all[:max]
 	}
-	return all, errors.Join(errs...)
+	if len(partErrs.Failures) > 0 {
+		return all, partErrs
+	}
+	return all, nil
 }
 
 // FetchMessagesAll 对全部分区应用同一 offset 范围，合计不超过 max。
@@ -293,11 +329,12 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 		results[i] = partResult{msgs: msgs, err: e}
 	})
 	var all []MessageInfo
-	var errs []error
-	for _, r := range results {
+	var partErrs PartitionErrors
+	partErrs.Total = count
+	for i, r := range results {
 		all = append(all, r.msgs...)
 		if r.err != nil {
-			errs = append(errs, r.err)
+			partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: int32(i), Err: r.err})
 		}
 	}
 	sort.Slice(all, func(i, j int) bool {
@@ -309,7 +346,10 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 	if len(all) > max {
 		all = all[:max]
 	}
-	return all, errors.Join(errs...)
+	if len(partErrs.Failures) > 0 {
+		return all, partErrs
+	}
+	return all, nil
 }
 
 // StartLiveTail 启动实时消息监听，从最新消息（HWM）开始持续消费新到达的消息并发送到 msgCh。
@@ -461,6 +501,7 @@ func (kc *KafkaClient) ProduceMessage(ctx context.Context, topic string, partiti
 	if err == nil {
 		g.Log().Infof(ctx, "发送消息成功 topic=%s partition=%d offset=%d", topic, pid, offset)
 	}
+	AuditLog(AuditProduceMessage, fmt.Sprintf("%s[p=%d]", topic, pid), kc.connName(), err)
 	return pid, offset, err
 }
 

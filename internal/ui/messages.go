@@ -2,9 +2,12 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
+	"time"
 
 	"lly_kafka/internal/core"
 
@@ -35,11 +38,13 @@ type messagesPanel struct {
 	countE     *widget.Entry
 	startE     *widget.Entry
 	endE       *widget.Entry
+	timeE      *widget.Entry
 	keyFilter  *widget.Entry
 	valFilter  *widget.Entry
 	btnFetch   *widget.Button
 	btnCancel  *widget.Button
 	btnProduce *widget.Button
+	btnExport  *widget.Button
 	statusLbl  *widget.Label
 
 	table       *widget.Table
@@ -81,11 +86,14 @@ func (p *messagesPanel) build() fyne.CanvasObject {
 	p.endE = widget.NewEntry()
 	p.endE.SetText("0")
 
-	p.mode = widget.NewRadioGroup([]string{"最新 N 条", "指定 Offset 范围"}, func(string) {
+	p.mode = widget.NewRadioGroup([]string{"最新 N 条", "指定 Offset 范围", "按时间"}, func(string) {
 		p.updateModeFields()
 	})
 	p.mode.Horizontal = true
 	p.mode.SetSelected("最新 N 条")
+
+	p.timeE = widget.NewEntry()
+	p.timeE.SetPlaceHolder("2026-08-26 12:00:00")
 
 	p.keyFilter = widget.NewEntry()
 	p.keyFilter.SetPlaceHolder("过滤 Key")
@@ -98,6 +106,7 @@ func (p *messagesPanel) build() fyne.CanvasObject {
 	p.btnCancel = widget.NewButtonWithIcon("取消", theme.CancelIcon(), p.onCancelFetch)
 	p.btnCancel.Disable()
 	p.btnProduce = widget.NewButtonWithIcon("发送消息", theme.MailSendIcon(), p.onProduce)
+	p.btnExport = widget.NewButtonWithIcon("导出 JSON", theme.DocumentSaveIcon(), p.onExport)
 	p.statusLbl = widget.NewLabel("就绪")
 	p.statusLbl.Importance = widget.MediumImportance
 
@@ -134,15 +143,19 @@ func (p *messagesPanel) build() fyne.CanvasObject {
 			widget.NewLabel("起始:"), p.startE,
 			widget.NewLabel("结束:"), p.endE,
 		),
+		container.NewGridWithColumns(2,
+			widget.NewLabel("起始时间:"), p.timeE,
+		),
 		container.NewGridWithColumns(4,
 			widget.NewLabel("Key 含:"), p.keyFilter,
 			widget.NewLabel("Value 含:"), p.valFilter,
 		),
-		container.NewHBox(p.btnFetch, p.btnCancel, p.btnProduce, p.statusLbl),
+		container.NewHBox(p.btnFetch, p.btnCancel, p.btnProduce, p.btnExport, p.statusLbl),
 	)
 
 	scroll := container.NewVScroll(p.table)
 	scroll.SetMinSize(fyne.NewSize(600, 400))
+	p.updateModeFields()
 	return container.NewBorder(form, nil, nil, nil, scroll)
 }
 
@@ -193,17 +206,29 @@ func (p *messagesPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject)
 }
 
 func (p *messagesPanel) updateModeFields() {
-	if p.countE == nil || p.startE == nil || p.endE == nil {
+	if p.countE == nil || p.startE == nil || p.endE == nil || p.timeE == nil {
 		return
 	}
-	if p.mode != nil && p.mode.Selected == "最新 N 条" {
+	mode := ""
+	if p.mode != nil {
+		mode = p.mode.Selected
+	}
+	switch mode {
+	case "最新 N 条":
 		p.countE.Enable()
 		p.startE.Disable()
 		p.endE.Disable()
-	} else {
+		p.timeE.Disable()
+	case "按时间":
+		p.countE.Disable()
+		p.startE.Disable()
+		p.endE.Disable()
+		p.timeE.Enable()
+	default: // 指定 Offset 范围
 		p.countE.Disable()
 		p.startE.Enable()
 		p.endE.Enable()
+		p.timeE.Disable()
 	}
 }
 
@@ -309,16 +334,32 @@ func (p *messagesPanel) onFetch() {
 	}
 	allParts := partStr == partAll
 	part := int32(gconv.Int(partStr))
-	latest := p.mode.Selected == "最新 N 条"
+	mode := p.mode.Selected
+	latest := mode == "最新 N 条"
+	byTime := mode == "按时间"
 	n := int64(gconv.Int(p.countE.Text))
 	if n <= 0 {
 		n = int64(p.cfg.DefaultMessageCount)
 	}
 	start := gconv.Int64(p.startE.Text)
 	end := gconv.Int64(p.endE.Text)
-	if !latest && end > 0 && end < start {
+	if !latest && !byTime && end > 0 && end < start {
 		showInfo(p.win, "提示", "结束 offset 应大于或等于起始 offset")
 		return
+	}
+	var startTime time.Time
+	if byTime {
+		ts := strings.TrimSpace(p.timeE.Text)
+		if ts == "" {
+			showInfo(p.win, "提示", "请输入起始时间")
+			return
+		}
+		t, err := parseTimeInput(ts)
+		if err != nil {
+			showInfo(p.win, "提示", "时间格式无效，请使用 2026-08-26 12:00:00 或 2026-08-26")
+			return
+		}
+		startTime = t
 	}
 
 	if p.fetchCancel != nil {
@@ -335,6 +376,12 @@ func (p *messagesPanel) onFetch() {
 	max := p.cfg.FetchMaxMessages
 	alive := p.client.Context()
 	fetchAndShow(alive, func() ([]core.MessageInfo, error) {
+		if byTime {
+			if allParts {
+				return p.client.FetchByTimeAll(fetchCtx, topic, startTime, max)
+			}
+			return p.client.FetchByTime(fetchCtx, topic, part, startTime, max)
+		}
 		if allParts {
 			if latest {
 				return p.client.FetchLatestAll(fetchCtx, topic, int(n), max)
@@ -368,7 +415,12 @@ func (p *messagesPanel) onFetch() {
 		}
 		if err != nil {
 			p.statusLbl.SetText(fmt.Sprintf("拉取不完整，收到 %d 条消息", len(msgs)))
-			showError(p.win, "拉取消息失败", err)
+			var partErrs core.PartitionErrors
+			if errors.As(err, &partErrs) {
+				showInfo(p.win, "部分分区拉取失败", partErrs.Error())
+			} else {
+				showError(p.win, "拉取消息失败", err)
+			}
 			return
 		}
 		if len(msgs) == 0 {
@@ -468,4 +520,95 @@ func (p *messagesPanel) onProduce() {
 	}, p.win)
 	d.Resize(fyne.NewSize(520, 420))
 	d.Show()
+}
+
+// exportedMessage 用于 JSON 导出的消息结构。
+type exportedMessage struct {
+	Topic     string            `json:"topic"`
+	Partition int32             `json:"partition"`
+	Offset    int64             `json:"offset"`
+	Key       string            `json:"key"`
+	Value     string            `json:"value"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Timestamp string            `json:"timestamp"`
+	Size      int               `json:"size"`
+}
+
+func (p *messagesPanel) onExport() {
+	if len(p.allRows) == 0 {
+		showInfo(p.win, "提示", "没有可导出的消息，请先拉取消息")
+		return
+	}
+	rows := p.rows
+	if len(rows) == 0 {
+		showInfo(p.win, "提示", "当前过滤结果为空，请调整过滤条件")
+		return
+	}
+
+	dlg := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil {
+			showError(p.win, "导出失败", err)
+			return
+		}
+		if writer == nil {
+			return // 用户取消
+		}
+		defer writer.Close()
+
+		exported := make([]exportedMessage, 0, len(rows))
+		for _, m := range rows {
+			em := exportedMessage{
+				Topic:     m.Topic,
+				Partition: m.Partition,
+				Offset:    m.Offset,
+				Key:       core.FormatPayload(m.Key),
+				Value:     core.FormatPayload(m.Value),
+				Timestamp: "",
+				Size:      m.Size,
+			}
+			if !m.Timestamp.IsZero() {
+				em.Timestamp = m.Timestamp.Format("2006-01-02 15:04:05")
+			}
+			if len(m.Headers) > 0 {
+				em.Headers = make(map[string]string, len(m.Headers))
+				for _, h := range m.Headers {
+					em.Headers[h.Key] = h.Value
+				}
+			}
+			exported = append(exported, em)
+		}
+
+		data, err := json.MarshalIndent(exported, "", "  ")
+		if err != nil {
+			showError(p.win, "序列化失败", err)
+			return
+		}
+		if _, err := writer.Write(data); err != nil {
+			showError(p.win, "写入文件失败", err)
+			return
+		}
+		showInfo(p.win, "导出成功", fmt.Sprintf("已导出 %d 条消息", len(exported)))
+	}, p.win)
+	dlg.SetFileName("messages.json")
+	dlg.Resize(fyne.NewSize(600, 400))
+	dlg.Show()
+}
+
+// parseTimeInput 解析用户输入的时间字符串，支持多种格式。
+func parseTimeInput(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	layouts := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02",
+		"2006/01/02 15:04:05",
+		"2006/01/02 15:04",
+		"2006/01/02",
+	}
+	for _, layout := range layouts {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("无法解析时间: %s", s)
 }

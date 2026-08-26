@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 
 	"lly_kafka/internal/core"
 
@@ -25,9 +26,10 @@ type groupsPanel struct {
 	list      *widget.List
 	selected  string
 
-	infoHead *widget.Label
-	table    *widget.Table
-	rows     []core.GroupTopicOffset
+	infoHead  *widget.Label
+	memberLbl *widget.Label
+	table     *widget.Table
+	rows      []core.GroupTopicOffset
 }
 
 func newGroupsPanel(win fyne.Window, client *core.KafkaClient) *groupsPanel {
@@ -75,6 +77,10 @@ func (p *groupsPanel) build() fyne.CanvasObject {
 
 	p.infoHead = widget.NewLabelWithStyle("请选择消费组", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	p.infoHead.Wrapping = fyne.TextWrapWord
+	p.memberLbl = widget.NewLabel("")
+	p.memberLbl.Wrapping = fyne.TextWrapWord
+	memberScroll := container.NewVScroll(p.memberLbl)
+	memberScroll.SetMinSize(fyne.NewSize(0, 100))
 	p.table = widget.NewTable(
 		func() (int, int) { return len(p.rows) + 1, 5 },
 		func() fyne.CanvasObject {
@@ -90,7 +96,9 @@ func (p *groupsPanel) build() fyne.CanvasObject {
 	p.table.SetColumnWidth(3, 140)
 	p.table.SetColumnWidth(4, 120)
 
-	right := container.NewBorder(p.infoHead, nil, nil, nil,
+	right := container.NewBorder(
+		container.NewVBox(p.infoHead, memberScroll),
+		nil, nil, nil,
 		container.NewVScroll(p.table))
 
 	split := container.NewHSplit(left, right)
@@ -239,6 +247,50 @@ func (p *groupsPanel) refreshOffsets() {
 		p.infoHead.SetText(fmt.Sprintf("消费组: %s  ·  %d 个分区  ·  总 Lag %d  ·  %d 个分区落后", group, len(rows), total, n))
 		p.table.Refresh()
 	})
+
+	// 同时加载成员详情
+	if p.memberLbl != nil {
+		p.memberLbl.SetText("加载成员信息...")
+	}
+	fetchAndShow(p.client.Context(), func() (*core.GroupDetail, error) {
+		return p.client.DescribeGroup(p.client.Context(), group)
+	}, func(detail *core.GroupDetail, err error) {
+		if p.selected != group {
+			return
+		}
+		if err != nil {
+			if p.memberLbl != nil {
+				p.memberLbl.SetText("成员信息加载失败: " + err.Error())
+			}
+			return
+		}
+		if p.memberLbl != nil {
+			p.memberLbl.SetText(formatGroupMembers(detail))
+		}
+	})
+}
+
+// formatGroupMembers 格式化消费组成员信息。
+func formatGroupMembers(d *core.GroupDetail) string {
+	if d == nil || len(d.Members) == 0 {
+		return "成员: (无)"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("成员 (%d, 协议: %s, 状态: %s):\n", len(d.Members), d.Protocol, d.State))
+	for i, m := range d.Members {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(fmt.Sprintf("  • %s @ %s", m.ClientID, m.ClientHost))
+		if len(m.Assignments) > 0 {
+			topics := make([]string, 0, len(m.Assignments))
+			for topic, parts := range m.Assignments {
+				topics = append(topics, fmt.Sprintf("%s[%s]", topic, formatInts(parts)))
+			}
+			sb.WriteString("  → " + strings.Join(topics, ", "))
+		}
+	}
+	return sb.String()
 }
 
 func (p *groupsPanel) onReset(to string) {

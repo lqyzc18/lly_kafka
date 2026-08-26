@@ -194,6 +194,14 @@ func (kc *KafkaClient) Connection() *Connection {
 	return &cp
 }
 
+// connName 返回当前连接名称，用于日志和审计。
+func (kc *KafkaClient) connName() string {
+	if kc.conn == nil {
+		return ""
+	}
+	return kc.conn.Name
+}
+
 // KafkaVersion 返回协商后的 Kafka 版本字符串。
 func (kc *KafkaClient) KafkaVersion() string {
 	if kc.client == nil {

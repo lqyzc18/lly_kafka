@@ -157,10 +157,12 @@ func (kc *KafkaClient) CreateTopic(ctx context.Context, name string, partitions 
 		}
 	}
 	if err := kc.admin.CreateTopic(name, detail, false); err != nil {
+		AuditLog(AuditCreateTopic, name, kc.connName(), err)
 		return err
 	}
 	kc.invalidateTopics()
 	g.Log().Infof(ctx, "创建 Topic: %s (partitions=%d, replication=%d)", name, partitions, replication)
+	AuditLog(AuditCreateTopic, name, kc.connName(), nil)
 	return nil
 }
 
@@ -173,10 +175,12 @@ func (kc *KafkaClient) DeleteTopic(ctx context.Context, name string) error {
 		return errors.New("Topic 名称不能为空")
 	}
 	if err := kc.admin.DeleteTopic(name); err != nil {
+		AuditLog(AuditDeleteTopic, name, kc.connName(), err)
 		return err
 	}
 	kc.invalidateTopics()
 	g.Log().Infof(ctx, "删除 Topic: %s", name)
+	AuditLog(AuditDeleteTopic, name, kc.connName(), nil)
 	return nil
 }
 
@@ -189,10 +193,12 @@ func (kc *KafkaClient) ExpandPartitions(ctx context.Context, name string, count 
 		return errors.New("分区数必须大于 0")
 	}
 	if err := kc.admin.CreatePartitions(name, count, nil, false); err != nil {
+		AuditLog(AuditExpandPartitions, fmt.Sprintf("%s -> %d partitions", name, count), kc.connName(), err)
 		return err
 	}
 	kc.invalidateTopics()
 	g.Log().Infof(ctx, "扩容 Topic %s 分区数到 %d", name, count)
+	AuditLog(AuditExpandPartitions, fmt.Sprintf("%s -> %d partitions", name, count), kc.connName(), nil)
 	return nil
 }
 
@@ -210,9 +216,11 @@ func (kc *KafkaClient) AlterTopicConfig(ctx context.Context, name string, config
 		entries[k] = &vv
 	}
 	if err := kc.admin.AlterConfig(sarama.TopicResource, name, entries, false); err != nil {
+		AuditLog(AuditAlterTopicConfig, name, kc.connName(), err)
 		return err
 	}
 	g.Log().Infof(ctx, "修改 Topic 配置: %s", name)
+	AuditLog(AuditAlterTopicConfig, name, kc.connName(), nil)
 	return nil
 }
 

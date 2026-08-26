@@ -18,6 +18,21 @@ type GroupInfo struct {
 	Members      int
 }
 
+// MemberInfo 消费组成员信息
+type MemberInfo struct {
+	MemberID    string
+	ClientID    string
+	ClientHost  string
+	Assignments map[string][]int32 // topic -> 分区列表
+}
+
+// GroupDetail 消费组详情（含成员列表）
+type GroupDetail struct {
+	GroupInfo
+	Protocol string
+	Members  []MemberInfo
+}
+
 // GroupTopicOffset 消费组在某个 Topic 分区上的消费进度与 lag。
 //   - GroupOffset: 消费组已提交偏移
 //   - LogEndOffset: 该分区最新 offset（HighWaterMark）
@@ -71,6 +86,52 @@ func (kc *KafkaClient) ListGroups(ctx context.Context) ([]GroupInfo, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// DescribeGroup 返回单个消费组的详情（含成员列表和分区分配）。
+func (kc *KafkaClient) DescribeGroup(ctx context.Context, group string) (*GroupDetail, error) {
+	if err := kc.alive(ctx); err != nil {
+		return nil, err
+	}
+	descs, err := kc.admin.DescribeConsumerGroups([]string{group})
+	if err != nil {
+		return nil, err
+	}
+	if len(descs) == 0 {
+		return nil, fmt.Errorf("消费组 %s 未找到", group)
+	}
+	d := descs[0]
+	if d.Err != sarama.ErrNoError {
+		return nil, fmt.Errorf("消费组 %s 查询失败: %v", group, d.Err)
+	}
+	detail := &GroupDetail{
+		GroupInfo: GroupInfo{
+			Name:         d.GroupId,
+			State:        d.State,
+			ProtocolType: d.ProtocolType,
+			Members:      len(d.Members),
+		},
+		Protocol: d.Protocol,
+		Members:  make([]MemberInfo, 0, len(d.Members)),
+	}
+	for memberID, m := range d.Members {
+		mi := MemberInfo{
+			MemberID:    memberID,
+			ClientID:    m.ClientId,
+			ClientHost:  m.ClientHost,
+			Assignments: make(map[string][]int32),
+		}
+		if assignment, aerr := m.GetMemberAssignment(); aerr == nil && assignment != nil {
+			for topic, parts := range assignment.Topics {
+				mi.Assignments[topic] = append([]int32(nil), parts...)
+			}
+		}
+		detail.Members = append(detail.Members, mi)
+	}
+	sort.Slice(detail.Members, func(i, j int) bool {
+		return detail.Members[i].ClientID < detail.Members[j].ClientID
+	})
+	return detail, nil
 }
 
 // GroupOffsets 返回消费组在所有 Topic/分区上的消费进度与 lag。
@@ -185,17 +246,22 @@ func (kc *KafkaClient) ResetGroupOffsets(ctx context.Context, group, to string) 
 	}
 	resp, err := kc.admin.AlterConsumerGroupOffsets(group, offsets, nil)
 	if err != nil {
+		AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), err)
 		return err
 	}
 	if resp == nil {
+		AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), nil)
 		return nil
 	}
 	for topic, parts := range resp.Errors {
 		for pid, e := range parts {
 			if e != sarama.ErrNoError {
-				return fmt.Errorf("重置 %s[%d] 失败: %v", topic, pid, e)
+				resetErr := fmt.Errorf("重置 %s[%d] 失败: %v", topic, pid, e)
+				AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), resetErr)
+				return resetErr
 			}
 		}
 	}
+	AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), nil)
 	return nil
 }
