@@ -2,10 +2,7 @@ package core
 
 import (
 	"context"
-	"net"
 	"sort"
-
-	"github.com/gogf/gf/v2/util/gconv"
 )
 
 // BrokerInfo 集群 Broker 信息
@@ -22,23 +19,23 @@ func (kc *KafkaClient) ListBrokers(ctx context.Context) ([]BrokerInfo, error) {
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
-	controllerID := int32(-1)
-	if c, err := kc.admin.Controller(); err == nil && c != nil {
-		controllerID = c.ID()
+	meta, err := kc.admin.BrokerMetadata(ctx)
+	if err != nil {
+		return nil, err
 	}
-	brokers := kc.client.Brokers()
-	out := make([]BrokerInfo, 0, len(brokers))
-	for _, b := range brokers {
-		host, portStr := b.Addr(), ""
-		if h, p, err := net.SplitHostPort(b.Addr()); err == nil {
-			host, portStr = h, p
+	controllerID := meta.Controller
+	out := make([]BrokerInfo, 0, len(meta.Brokers))
+	for _, b := range meta.Brokers {
+		rack := ""
+		if b.Rack != nil {
+			rack = *b.Rack
 		}
 		out = append(out, BrokerInfo{
-			ID:         b.ID(),
-			Host:       host,
-			Port:       gconv.Int32(portStr),
-			Rack:       b.Rack(),
-			Controller: b.ID() == controllerID,
+			ID:         b.NodeID,
+			Host:       b.Host,
+			Port:       int32(b.Port),
+			Rack:       rack,
+			Controller: b.NodeID == controllerID,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })

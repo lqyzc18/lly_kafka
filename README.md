@@ -4,7 +4,7 @@
 
 - **桌面 UI**：[`fyne-io/fyne`](https://github.com/fyne-io/fyne)
 - **底层框架**：[`gogf/gf`](https://github.com/gogf/gf)
-- **Kafka 客户端**：[`IBM/sarama`](https://github.com/IBM/sarama)
+- **Kafka 客户端**：[`twmb/franz-go`](https://github.com/twmb/franz-go)
 
 ## 功能
 

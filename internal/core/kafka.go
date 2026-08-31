@@ -7,25 +7,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/gogf/gf/v2/frame/g"
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 var errClientClosed = errors.New("kafka client 已关闭")
 
-// KafkaClient 对 sarama 的封装，提供集群管理能力。
-// Admin 在连接时创建；Consumer / Producer 按需懒加载。
+// KafkaClient 对 franz-go 的封装，提供集群管理能力。
+// kgo.Client 天然支持并发和 context，无需懒加载 Consumer/Producer。
 type KafkaClient struct {
 	mu     sync.Mutex
 	closed bool
 	cancel context.CancelFunc
 	ctx    context.Context
 
-	conn     *Connection
-	client   sarama.Client
-	admin    sarama.ClusterAdmin
-	consumer sarama.Consumer
-	producer sarama.SyncProducer
+	conn   *Connection
+	client *kgo.Client
+	admin  *kadm.Client
 
 	topicMu    sync.RWMutex
 	topicNames []string
@@ -33,7 +32,7 @@ type KafkaClient struct {
 }
 
 // NewKafkaClient 根据连接配置创建 Kafka 客户端。
-// 若 Kafka 版本不识别，回退到 2.6.0 以保证最大兼容性。
+// franz-go 自动协商协议版本，无需手动指定 Kafka version。
 func NewKafkaClient(ctx context.Context, conn *Connection) (*KafkaClient, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -43,55 +42,44 @@ func NewKafkaClient(ctx context.Context, conn *Connection) (*KafkaClient, error)
 		return nil, errors.New("broker 地址不能为空")
 	}
 
-	cfg := sarama.NewConfig()
-	cfg.ClientID = conn.ClientID
-	if cfg.ClientID == "" {
-		cfg.ClientID = "lly-kafka"
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.ClientID(conn.ClientID),
+		kgo.DialTimeout(8 * time.Second),
+		kgo.RequestTimeoutOverhead(5 * time.Second),
+		// 手动分区时直接按 record.Partition 发送。
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 	}
-	ver, err := sarama.ParseKafkaVersion(conn.Version)
-	if err != nil || conn.Version == "" {
-		g.Log().Warningf(ctx, "Kafka 版本 %q 无法解析，回退到 v2.6.0", conn.Version)
-		ver = sarama.V2_6_0_0
-	}
-	cfg.Version = ver
-	cfg.Consumer.Return.Errors = true
-	cfg.Consumer.MaxProcessingTime = 5 * time.Second
-	cfg.Producer.Return.Successes = true
-	cfg.Producer.Timeout = 10 * time.Second
-	cfg.Producer.Partitioner = func(topic string) sarama.Partitioner {
-		return &flexiblePartitioner{hash: sarama.NewHashPartitioner(topic)}
-	}
-	cfg.Net.DialTimeout = 8 * time.Second
-	cfg.Net.ReadTimeout = 15 * time.Second
-	// Full=false 时 NewClusterAdminFromClient 无法获取 Controller。
-	cfg.Metadata.Full = true
-	cfg.Metadata.AllowAutoTopicCreation = false
-	cfg.Metadata.Timeout = 10 * time.Second
 
-	if err := applySecurity(cfg, conn); err != nil {
+	if err := applySecurity(&opts, conn); err != nil {
 		return nil, err
 	}
 
-	client, err := sarama.NewClient(brokers, cfg)
+	client, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, err
 	}
-	admin, err := sarama.NewClusterAdminFromClient(client)
+
+	// 验证连通性：BrokerMetadata 不加载 topic，轻量。
+	metaCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	meta, err := kadm.NewClient(client).BrokerMetadata(metaCtx)
+	cancel()
 	if err != nil {
-		_ = client.Close()
+		client.Close()
 		return nil, err
 	}
 
-	cctx, cancel := context.WithCancel(ctx)
+	cctx, cancelCtx := context.WithCancel(ctx)
 	cp := *conn
 	kc := &KafkaClient{
 		ctx:    cctx,
-		cancel: cancel,
+		cancel: cancelCtx,
 		conn:   &cp,
 		client: client,
-		admin:  admin,
+		admin:  kadm.NewClient(client),
 	}
-	g.Log().Infof(ctx, "已连接 Kafka: %s (%s) security=%s, 协议版本 %s", conn.Name, conn.Brokers, conn.Security, ver)
+	g.Log().Infof(ctx, "已连接 Kafka: %s (%s) security=%s, brokers=%d, cluster=%s",
+		conn.Name, conn.Brokers, conn.Security, len(meta.Brokers), meta.Cluster)
 	return kc, nil
 }
 
@@ -107,7 +95,7 @@ func TestConnection(ctx context.Context, conn *Connection) (version string, brok
 		return "", 0, err
 	}
 	defer kc.Close()
-	return kc.KafkaVersion(), kc.BrokerCount(), nil
+	return kc.KafkaVersion(ctx), kc.BrokerCount(ctx), nil
 }
 
 // Context 返回随 Close 取消的上下文，用于丢弃断开后的异步回调。
@@ -130,29 +118,15 @@ func (kc *KafkaClient) Close() {
 	}
 	kc.closed = true
 	cancel := kc.cancel
-	producer := kc.producer
-	consumer := kc.consumer
-	admin := kc.admin
 	client := kc.client
 	kc.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
-	// Sarama requires partition consumers to finish before their shared
-	// Consumer/Admin client is closed.
 	kc.fetches.Wait()
-	if producer != nil {
-		_ = producer.Close()
-	}
-	if consumer != nil {
-		_ = consumer.Close()
-	}
-	if admin != nil {
-		_ = admin.Close()
-	}
 	if client != nil {
-		_ = client.Close()
+		client.Close()
 	}
 }
 
@@ -204,86 +178,36 @@ func (kc *KafkaClient) connName() string {
 	return kc.conn.Name
 }
 
-// KafkaVersion 返回协商后的 Kafka 版本字符串。
-func (kc *KafkaClient) KafkaVersion() string {
+// KafkaVersion 返回协商后的 Kafka 版本字符串（实际为 API 版本上限）。
+func (kc *KafkaClient) KafkaVersion(ctx context.Context) string {
 	if kc.client == nil {
 		return ""
 	}
-	return kc.client.Config().Version.String()
+	// franz-go 没有显式 "Kafka version"，返回 broker 支持的最大 API 版本。
+	// 这里简化处理：返回一个描述性字符串。
+	if ctx == nil {
+		ctx = kc.Context()
+	}
+	meta, err := kc.admin.BrokerMetadata(ctx)
+	if err != nil || len(meta.Brokers) == 0 {
+		return "unknown"
+	}
+	return "auto-negotiated"
 }
 
 // BrokerCount 返回集群 Broker 数量。
-func (kc *KafkaClient) BrokerCount() int {
+func (kc *KafkaClient) BrokerCount(ctx context.Context) int {
 	if kc.client == nil {
 		return 0
 	}
-	return len(kc.client.Brokers())
-}
-
-func (kc *KafkaClient) getConsumer() (sarama.Consumer, error) {
-	kc.mu.Lock()
-	if kc.closed {
-		kc.mu.Unlock()
-		return nil, errClientClosed
+	if ctx == nil {
+		ctx = kc.Context()
 	}
-	if kc.consumer != nil {
-		c := kc.consumer
-		kc.mu.Unlock()
-		return c, nil
-	}
-	client := kc.client
-	kc.mu.Unlock()
-
-	c, err := sarama.NewConsumerFromClient(client)
+	meta, err := kc.admin.BrokerMetadata(ctx)
 	if err != nil {
-		return nil, err
+		return 0
 	}
-
-	kc.mu.Lock()
-	defer kc.mu.Unlock()
-	if kc.closed {
-		_ = c.Close()
-		return nil, errClientClosed
-	}
-	if kc.consumer != nil {
-		_ = c.Close()
-		return kc.consumer, nil
-	}
-	kc.consumer = c
-	return c, nil
-}
-
-func (kc *KafkaClient) getProducer() (sarama.SyncProducer, error) {
-	kc.mu.Lock()
-	if kc.closed {
-		kc.mu.Unlock()
-		return nil, errClientClosed
-	}
-	if kc.producer != nil {
-		p := kc.producer
-		kc.mu.Unlock()
-		return p, nil
-	}
-	client := kc.client
-	kc.mu.Unlock()
-
-	p, err := sarama.NewSyncProducerFromClient(client)
-	if err != nil {
-		return nil, err
-	}
-
-	kc.mu.Lock()
-	defer kc.mu.Unlock()
-	if kc.closed {
-		_ = p.Close()
-		return nil, errClientClosed
-	}
-	if kc.producer != nil {
-		_ = p.Close()
-		return kc.producer, nil
-	}
-	kc.producer = p
-	return p, nil
+	return len(meta.Brokers)
 }
 
 func parseBrokers(s string) []string {

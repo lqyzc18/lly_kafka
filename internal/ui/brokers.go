@@ -120,7 +120,7 @@ func (p *brokersPanel) refresh() {
 			return
 		}
 		p.rows = rows
-		p.info.SetText(fmt.Sprintf("共 %d 个 Broker | 协议版本: %s", len(rows), p.client.KafkaVersion()))
+		p.info.SetText(fmt.Sprintf("共 %d 个 Broker | 协议版本: %s", len(rows), p.client.KafkaVersion(p.client.Context())))
 		p.table.Refresh()
 	})
 }

@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/IBM/sarama"
+	"github.com/twmb/franz-go/pkg/kadm"
 )
 
 // GroupInfo 消费组概要信息
@@ -50,39 +50,27 @@ func (kc *KafkaClient) ListGroups(ctx context.Context) ([]GroupInfo, error) {
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
-	summaries, err := kc.admin.ListConsumerGroups()
+	listed, err := kc.admin.ListGroups(ctx)
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(summaries))
-	for name := range summaries {
-		names = append(names, name)
-	}
+	names := listed.Groups()
 	if len(names) == 0 {
 		return []GroupInfo{}, nil
 	}
-	const batch = 32
-	out := make([]GroupInfo, 0, len(names))
-	for i := 0; i < len(names); i += batch {
-		if err := ctxErr(ctx); err != nil {
-			return nil, err
-		}
-		end := i + batch
-		if end > len(names) {
-			end = len(names)
-		}
-		descs, err := kc.admin.DescribeConsumerGroups(names[i:end])
-		if err != nil {
-			return nil, err
-		}
-		for _, d := range descs {
-			out = append(out, GroupInfo{
-				Name:         d.GroupId,
-				State:        d.State,
-				ProtocolType: d.ProtocolType,
-				Members:      len(d.Members),
-			})
-		}
+	// 批量 DescribeGroups 获取成员数
+	described, err := kc.admin.DescribeGroups(ctx, names...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]GroupInfo, 0, len(described))
+	for _, d := range described {
+		out = append(out, GroupInfo{
+			Name:         d.Group,
+			State:        d.State,
+			ProtocolType: d.ProtocolType,
+			Members:      len(d.Members),
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
@@ -93,20 +81,20 @@ func (kc *KafkaClient) DescribeGroup(ctx context.Context, group string) (*GroupD
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
-	descs, err := kc.admin.DescribeConsumerGroups([]string{group})
+	described, err := kc.admin.DescribeGroups(ctx, group)
 	if err != nil {
 		return nil, err
 	}
-	if len(descs) == 0 {
+	d, ok := described[group]
+	if !ok {
 		return nil, fmt.Errorf("消费组 %s 未找到", group)
 	}
-	d := descs[0]
-	if d.Err != sarama.ErrNoError {
+	if d.Err != nil {
 		return nil, fmt.Errorf("消费组 %s 查询失败: %v", group, d.Err)
 	}
 	detail := &GroupDetail{
 		GroupInfo: GroupInfo{
-			Name:         d.GroupId,
+			Name:         d.Group,
 			State:        d.State,
 			ProtocolType: d.ProtocolType,
 			Members:      len(d.Members),
@@ -114,16 +102,17 @@ func (kc *KafkaClient) DescribeGroup(ctx context.Context, group string) (*GroupD
 		Protocol: d.Protocol,
 		Members:  make([]MemberInfo, 0, len(d.Members)),
 	}
-	for memberID, m := range d.Members {
+	for _, m := range d.Members {
 		mi := MemberInfo{
-			MemberID:    memberID,
-			ClientID:    m.ClientId,
+			MemberID:    m.MemberID,
+			ClientID:    m.ClientID,
 			ClientHost:  m.ClientHost,
 			Assignments: make(map[string][]int32),
 		}
-		if assignment, aerr := m.GetMemberAssignment(); aerr == nil && assignment != nil {
-			for topic, parts := range assignment.Topics {
-				mi.Assignments[topic] = append([]int32(nil), parts...)
+		// franz-go 的 AssignedPartitions 返回 TopicsSet，按 topic 分组
+		if assigned, ok := m.Assigned.AsConsumer(); ok {
+			for _, t := range assigned.Topics {
+				mi.Assignments[t.Topic] = append(mi.Assignments[t.Topic], t.Partitions...)
 			}
 		}
 		detail.Members = append(detail.Members, mi)
@@ -135,44 +124,32 @@ func (kc *KafkaClient) DescribeGroup(ctx context.Context, group string) (*GroupD
 }
 
 // GroupOffsets 返回消费组在所有 Topic/分区上的消费进度与 lag。
-// 内部使用 admin.ListConsumerGroupOffsets 的「全部 topic」模式（topics=nil）。
 func (kc *KafkaClient) GroupOffsets(ctx context.Context, group string) ([]GroupTopicOffset, error) {
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
-	resp, err := kc.admin.ListConsumerGroupOffsets(group, nil)
+	// 使用 kadm 的 Lag 功能，自动计算 lag
+	lagResp, err := kc.admin.Lag(ctx, group)
 	if err != nil {
 		return nil, err
 	}
-	var out []GroupTopicOffset
-	for topic, parts := range resp.Blocks {
-		for pid, block := range parts {
-			if block == nil {
-				continue
-			}
-			out = append(out, GroupTopicOffset{
-				Topic:        topic,
-				Partition:    pid,
-				GroupOffset:  block.Offset,
-				LogEndOffset: -1,
-				Lag:          -1,
-			})
-		}
+	lg, ok := lagResp[group]
+	if !ok {
+		return []GroupTopicOffset{}, nil
 	}
-	runBounded(len(out), defaultConcurrency, func(i int) {
-		if ctxErr(ctx) != nil {
-			return
+
+	var out []GroupTopicOffset
+	for topic, parts := range lg.Lag {
+		for partition, pl := range parts {
+			row := GroupTopicOffset{
+				Topic:       topic,
+				Partition:   partition,
+				GroupOffset: pl.Commit.At,
+			}
+			row.LogEndOffset = pl.End.Offset
+			row.Lag = computeGroupLag(row.GroupOffset, row.LogEndOffset)
+			out = append(out, row)
 		}
-		item := &out[i]
-		end, eerr := kc.client.GetOffset(item.Topic, item.Partition, sarama.OffsetNewest)
-		if eerr != nil {
-			return
-		}
-		item.LogEndOffset = end
-		item.Lag = computeGroupLag(item.GroupOffset, end)
-	})
-	if err := ctxErr(ctx); err != nil {
-		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Topic != out[j].Topic {
@@ -219,6 +196,8 @@ func (kc *KafkaClient) ResetGroupOffsets(ctx context.Context, group, to string) 
 	if group == "" {
 		return errors.New("消费组不能为空")
 	}
+
+	// 先拉取当前已提交的 offset
 	rows, err := kc.GroupOffsets(ctx, group)
 	if err != nil {
 		return err
@@ -226,50 +205,42 @@ func (kc *KafkaClient) ResetGroupOffsets(ctx context.Context, group, to string) 
 	if len(rows) == 0 {
 		return errors.New("该消费组没有已提交的分区")
 	}
-	offsets := make(map[string]map[int32]sarama.OffsetAndMetadata)
+
+	offsets := make(kadm.Offsets)
 	for _, r := range rows {
 		if err := ctxErr(ctx); err != nil {
 			return err
 		}
 		off := r.LogEndOffset
 		if to == OffsetResetEarliest {
-			oldest, oerr := kc.client.GetOffset(r.Topic, r.Partition, sarama.OffsetOldest)
+			oldest, oerr := kc.OldestOffset(ctx, r.Topic, r.Partition)
 			if oerr != nil {
 				return oerr
 			}
 			off = oldest
 		} else if off < 0 {
-			hwm, herr := kc.client.GetOffset(r.Topic, r.Partition, sarama.OffsetNewest)
+			hwm, herr := kc.NewestOffset(ctx, r.Topic, r.Partition)
 			if herr != nil {
 				return herr
 			}
 			off = hwm
 		}
-		if offsets[r.Topic] == nil {
-			offsets[r.Topic] = make(map[int32]sarama.OffsetAndMetadata)
-		}
-		offsets[r.Topic][r.Partition] = sarama.OffsetAndMetadata{
-			Offset:      off,
+		offsets.Add(kadm.Offset{
+			Topic:       r.Topic,
+			Partition:   r.Partition,
+			At:          off,
 			LeaderEpoch: -1,
-		}
+		})
 	}
-	resp, err := kc.admin.AlterConsumerGroupOffsets(group, offsets, nil)
+
+	resps, err := kc.admin.CommitOffsets(ctx, group, offsets)
 	if err != nil {
 		AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), err)
 		return err
 	}
-	if resp == nil {
-		AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), nil)
-		return nil
-	}
-	for topic, parts := range resp.Errors {
-		for pid, e := range parts {
-			if e != sarama.ErrNoError {
-				resetErr := fmt.Errorf("重置 %s[%d] 失败: %v", topic, pid, e)
-				AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), resetErr)
-				return resetErr
-			}
-		}
+	if err := resps.Error(); err != nil {
+		AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), err)
+		return err
 	}
 	AuditLog(AuditResetGroupOffset, fmt.Sprintf("%s -> %s", group, to), kc.connName(), nil)
 	return nil

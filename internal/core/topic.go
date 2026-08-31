@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/IBM/sarama"
 	"github.com/gogf/gf/v2/frame/g"
+	"github.com/twmb/franz-go/pkg/kadm"
 )
 
 // PartitionInfo 分区详细信息
@@ -49,7 +49,7 @@ func (kc *KafkaClient) RefreshTopicNames(ctx context.Context) ([]string, error) 
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
-	details, err := kc.admin.ListTopics()
+	details, err := kc.admin.ListTopics(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -72,66 +72,76 @@ func (kc *KafkaClient) TopicDetail(ctx context.Context, name string) (*TopicInfo
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
-	metas, err := kc.admin.DescribeTopics([]string{name})
+	meta, err := kc.admin.Metadata(ctx, name)
 	if err != nil {
 		return nil, err
 	}
-	if len(metas) == 0 {
+	td, ok := meta.Topics[name]
+	if !ok {
 		return nil, fmt.Errorf("topic %s 未找到", name)
 	}
-	meta := metas[0]
-	if meta.Err != sarama.ErrNoError {
-		return nil, meta.Err
+	if td.Err != nil {
+		return nil, td.Err
 	}
 
-	info := &TopicInfo{Name: meta.Name}
-	if len(meta.Partitions) > 0 {
-		info.ReplicationFactor = int16(len(meta.Partitions[0].Replicas))
-	}
-	info.NumPartitions = int32(len(meta.Partitions))
+	info := &TopicInfo{Name: name}
+	info.NumPartitions = int32(len(td.Partitions))
+	info.Partitions = make([]PartitionInfo, 0, len(td.Partitions))
 
-	info.Partitions = make([]PartitionInfo, len(meta.Partitions))
-	runBounded(len(meta.Partitions), defaultConcurrency, func(i int) {
-		if ctxErr(ctx) != nil {
-			return
-		}
-		p := meta.Partitions[i]
+	// 批量拉取所有分区的 start/end offset
+	starts, err := kc.admin.ListStartOffsets(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	ends, err := kc.admin.ListEndOffsets(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+
+	for pid, pd := range td.Partitions {
 		pi := PartitionInfo{
-			ID:           p.ID,
-			Leader:       p.Leader,
-			Replicas:     p.Replicas,
-			ISR:          p.Isr,
-			Offline:      p.OfflineReplicas,
+			ID:           pid,
+			Leader:       pd.Leader,
+			Replicas:     append([]int32(nil), pd.Replicas...),
+			ISR:          append([]int32(nil), pd.ISR...),
+			Offline:      append([]int32(nil), pd.OfflineReplicas...),
 			StartOffset:  -1,
 			EndOffset:    -1,
 			MessageCount: 0,
 		}
-		if start, err := kc.client.GetOffset(name, p.ID, sarama.OffsetOldest); err == nil {
-			pi.StartOffset = start
+		if so, ok := starts.Lookup(name, pid); ok && so.Err == nil {
+			pi.StartOffset = so.Offset
 		}
-		if end, err := kc.client.GetOffset(name, p.ID, sarama.OffsetNewest); err == nil {
-			pi.EndOffset = end
+		if eo, ok := ends.Lookup(name, pid); ok && eo.Err == nil {
+			pi.EndOffset = eo.Offset
 		}
 		if pi.StartOffset >= 0 && pi.EndOffset >= pi.StartOffset {
 			pi.MessageCount = pi.EndOffset - pi.StartOffset
 		}
-		info.Partitions[i] = pi
-	})
-	if err := ctxErr(ctx); err != nil {
-		return nil, err
+		info.Partitions = append(info.Partitions, pi)
 	}
+
+	// 第一个分区的副本数作为 topic 的 replication factor
+	if len(info.Partitions) > 0 {
+		info.ReplicationFactor = int16(len(info.Partitions[0].Replicas))
+	}
+
+	// 排序
 	sort.Slice(info.Partitions, func(i, j int) bool { return info.Partitions[i].ID < info.Partitions[j].ID })
 
-	if cfg, err := kc.admin.DescribeConfig(sarama.ConfigResource{Type: sarama.TopicResource, Name: name}); err == nil {
-		m := make(map[string]string, len(cfg))
-		for _, e := range cfg {
-			if !e.Sensitive {
-				m[e.Name] = e.Value
-			} else {
-				m[e.Name] = "(sensitive)"
+	// 拉取配置
+	if cfgs, err := kc.admin.DescribeTopicConfigs(ctx, name); err == nil {
+		if len(cfgs) > 0 {
+			m := make(map[string]string)
+			for _, c := range cfgs[0].Configs {
+				if !c.Sensitive {
+					m[c.Key] = c.MaybeValue()
+				} else {
+					m[c.Key] = "(sensitive)"
+				}
 			}
+			info.Configs = m
 		}
-		info.Configs = m
 	}
 	return info, nil
 }
@@ -145,20 +155,24 @@ func (kc *KafkaClient) CreateTopic(ctx context.Context, name string, partitions 
 	if name == "" {
 		return errors.New("Topic 名称不能为空")
 	}
-	detail := &sarama.TopicDetail{
-		NumPartitions:     partitions,
-		ReplicationFactor: replication,
-	}
+
+	var cfgMap map[string]*string
 	if len(configs) > 0 {
-		detail.ConfigEntries = make(map[string]*string, len(configs))
+		cfgMap = make(map[string]*string, len(configs))
 		for k, v := range configs {
 			vv := v
-			detail.ConfigEntries[k] = &vv
+			cfgMap[k] = &vv
 		}
 	}
-	if err := kc.admin.CreateTopic(name, detail, false); err != nil {
+
+	resp, err := kc.admin.CreateTopic(ctx, partitions, replication, cfgMap, name)
+	if err != nil {
 		AuditLog(AuditCreateTopic, name, kc.connName(), err)
 		return err
+	}
+	if resp.Err != nil {
+		AuditLog(AuditCreateTopic, name, kc.connName(), resp.Err)
+		return resp.Err
 	}
 	kc.invalidateTopics()
 	g.Log().Infof(ctx, "创建 Topic: %s (partitions=%d, replication=%d)", name, partitions, replication)
@@ -174,9 +188,14 @@ func (kc *KafkaClient) DeleteTopic(ctx context.Context, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("Topic 名称不能为空")
 	}
-	if err := kc.admin.DeleteTopic(name); err != nil {
+	resp, err := kc.admin.DeleteTopic(ctx, name)
+	if err != nil {
 		AuditLog(AuditDeleteTopic, name, kc.connName(), err)
 		return err
+	}
+	if resp.Err != nil {
+		AuditLog(AuditDeleteTopic, name, kc.connName(), resp.Err)
+		return resp.Err
 	}
 	kc.invalidateTopics()
 	g.Log().Infof(ctx, "删除 Topic: %s", name)
@@ -192,7 +211,13 @@ func (kc *KafkaClient) ExpandPartitions(ctx context.Context, name string, count 
 	if count <= 0 {
 		return errors.New("分区数必须大于 0")
 	}
-	if err := kc.admin.CreatePartitions(name, count, nil, false); err != nil {
+	// franz-go 用 UpdatePartitions 设置最终分区数
+	resp, err := kc.admin.UpdatePartitions(ctx, int(count), name)
+	if err != nil {
+		AuditLog(AuditExpandPartitions, fmt.Sprintf("%s -> %d partitions", name, count), kc.connName(), err)
+		return err
+	}
+	if err := resp.Error(); err != nil {
 		AuditLog(AuditExpandPartitions, fmt.Sprintf("%s -> %d partitions", name, count), kc.connName(), err)
 		return err
 	}
@@ -210,14 +235,27 @@ func (kc *KafkaClient) AlterTopicConfig(ctx context.Context, name string, config
 	if len(configs) == 0 {
 		return errors.New("配置不能为空")
 	}
-	entries := make(map[string]*string, len(configs))
+
+	alters := make([]kadm.AlterConfig, 0, len(configs))
 	for k, v := range configs {
 		vv := v
-		entries[k] = &vv
+		alters = append(alters, kadm.AlterConfig{
+			Op:    kadm.SetConfig,
+			Name:  k,
+			Value: &vv,
+		})
 	}
-	if err := kc.admin.AlterConfig(sarama.TopicResource, name, entries, false); err != nil {
+
+	resps, err := kc.admin.AlterTopicConfigs(ctx, alters, name)
+	if err != nil {
 		AuditLog(AuditAlterTopicConfig, name, kc.connName(), err)
 		return err
+	}
+	for _, r := range resps {
+		if r.Err != nil {
+			AuditLog(AuditAlterTopicConfig, name, kc.connName(), r.Err)
+			return r.Err
+		}
 	}
 	g.Log().Infof(ctx, "修改 Topic 配置: %s", name)
 	AuditLog(AuditAlterTopicConfig, name, kc.connName(), nil)
@@ -234,12 +272,16 @@ func (kc *KafkaClient) PartitionCount(ctx context.Context, name string) (int, er
 	if err := kc.alive(ctx); err != nil {
 		return 0, err
 	}
-	metas, err := kc.admin.DescribeTopics([]string{name})
+	meta, err := kc.admin.Metadata(ctx, name)
 	if err != nil {
 		return 0, err
 	}
-	if len(metas) == 0 || metas[0].Err != sarama.ErrNoError {
+	td, ok := meta.Topics[name]
+	if !ok {
 		return 0, fmt.Errorf("topic %s 未找到", name)
 	}
-	return len(metas[0].Partitions), nil
+	if td.Err != nil {
+		return 0, td.Err
+	}
+	return len(td.Partitions), nil
 }

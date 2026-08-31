@@ -2,7 +2,7 @@
 //   - 配置加载（gcfg）
 //   - 日志（glog）
 //   - 连接配置存储（gjson + gfile）
-//   - Kafka 操作（封装 sarama）
+//   - Kafka 操作（封装 franz-go）
 package core
 
 import (
