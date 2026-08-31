@@ -7,6 +7,7 @@ import (
 )
 
 // filterTopics 按大小写不敏感子串过滤，始终返回新切片，避免与源切片共享底层数组。
+// query 为空时返回全部，否则返回包含 query（不区分大小写）的项。
 func filterTopics(topics []string, query string) []string {
 	q := strings.TrimSpace(query)
 	if q == "" {

@@ -11,6 +11,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// versionOptions Kafka 版本下拉选项，franz-go 自动协商，此处仅作展示参考。
 var versionOptions = []string{
 	"4.0.0",
 	"3.9.0",
@@ -24,6 +25,7 @@ var versionOptions = []string{
 	"自动 (2.6.0)",
 }
 
+// securityOptions 安全协议下拉选项。
 var securityOptions = []string{
 	core.SecurityPlaintext,
 	core.SecuritySASLPlaintext,
@@ -31,12 +33,14 @@ var securityOptions = []string{
 	core.SecuritySASLSSL,
 }
 
+// saslOptions SASL 机制下拉选项。
 var saslOptions = []string{
 	core.SASLPlain,
 	core.SASLScramSHA256,
 	core.SASLScramSHA512,
 }
 
+// connectionDialog 弹出连接配置对话框（新建或编辑）。
 func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 	nameE := widget.NewEntry()
 	nameE.SetPlaceHolder("连接名称")
@@ -229,10 +233,12 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 	d.Show()
 }
 
+// onNewConn 处理「新建连接」按钮点击。
 func (mw *MainWindow) onNewConn() {
 	mw.connectionDialog(nil)
 }
 
+// onEditConn 处理「编辑连接」按钮点击，编辑当前选中的连接。
 func (mw *MainWindow) onEditConn() {
 	name := mw.connSel.Selected
 	if name == "" {
@@ -244,6 +250,7 @@ func (mw *MainWindow) onEditConn() {
 	}
 }
 
+// onTestConn 处理「测试」按钮点击，测试当前选中的连接。
 func (mw *MainWindow) onTestConn() {
 	name := mw.connSel.Selected
 	if name == "" {
@@ -279,6 +286,7 @@ func (mw *MainWindow) onTestConn() {
 	}()
 }
 
+// onDeleteConn 处理「删除」按钮点击，删除当前选中的连接。
 func (mw *MainWindow) onDeleteConn() {
 	name := mw.connSel.Selected
 	if name == "" {
@@ -313,6 +321,7 @@ func (mw *MainWindow) onDeleteConn() {
 	}, mw.win)
 }
 
+// refreshConnSel 刷新连接下拉列表，保持当前选中或回退到第一个。
 func (mw *MainWindow) refreshConnSel() {
 	names := mw.store.Names()
 	mw.connSel.Options = names

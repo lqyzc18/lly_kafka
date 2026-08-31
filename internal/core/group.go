@@ -170,6 +170,7 @@ const (
 )
 
 // computeGroupLag 计算滞后量。GroupOffset < 0 表示从未提交，Lag 保持 -1。
+// logEnd < groupOffset 表示分区已回滚（如日志压缩），也返回 -1。
 func computeGroupLag(groupOffset, logEnd int64) int64 {
 	if groupOffset < 0 || logEnd < 0 {
 		return -1

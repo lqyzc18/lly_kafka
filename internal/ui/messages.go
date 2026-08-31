@@ -22,6 +22,7 @@ import (
 
 const partAll = "全部"
 
+// messagesPanel 消息浏览面板，负责 Topic/分区选择、拉取、过滤、详情、发送和导出。
 type messagesPanel struct {
 	win      fyne.Window
 	client   *core.KafkaClient
@@ -56,6 +57,7 @@ type messagesPanel struct {
 	partUpdating bool
 }
 
+// newMessagesPanel 创建消息面板实例。
 func newMessagesPanel(win fyne.Window, client *core.KafkaClient, cfg *core.AppConfig, prefs fyne.Preferences, connName string) *messagesPanel {
 	return &messagesPanel{
 		win: win, client: client, cfg: cfg, prefs: prefs, connName: connName,
@@ -63,10 +65,12 @@ func newMessagesPanel(win fyne.Window, client *core.KafkaClient, cfg *core.AppCo
 	}
 }
 
+// prefKey 生成带连接名的偏好键，用于记住 Topic/分区选择。
 func (p *messagesPanel) prefKey(kind string) string {
 	return "msg." + kind + "." + p.connName
 }
 
+// build 构建消息面板的 UI 组件和事件绑定。
 func (p *messagesPanel) build() fyne.CanvasObject {
 	p.topicSel = newFilterSelect("筛选 Topic", func(s string) {
 		if p.prefs != nil && p.connName != "" && s != "" {
@@ -164,6 +168,7 @@ func (p *messagesPanel) build() fyne.CanvasObject {
 	return container.NewBorder(form, nil, nil, nil, scroll)
 }
 
+// updateCell 渲染表格单元格，处理越界行清空。
 func (p *messagesPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	label := obj.(*widget.Label)
 	label.Importance = widget.MediumImportance
@@ -211,6 +216,7 @@ func (p *messagesPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject)
 	}
 }
 
+// updateModeFields 根据拉取模式启用/禁用输入框。
 func (p *messagesPanel) updateModeFields() {
 	if p.countE == nil || p.startE == nil || p.endE == nil || p.timeE == nil {
 		return
@@ -238,11 +244,13 @@ func (p *messagesPanel) updateModeFields() {
 	}
 }
 
+// ensureLoaded 标记面板已加载并刷新 Topic 列表。
 func (p *messagesPanel) ensureLoaded() {
 	p.loaded = true
 	p.refresh()
 }
 
+// refresh 强制刷新 Topic 列表并恢复上次选择。
 func (p *messagesPanel) refresh() {
 	fetchAndShow(p.client.Context(), func() ([]string, error) {
 		return p.client.RefreshTopicNames(p.client.Context())
@@ -273,6 +281,7 @@ func (p *messagesPanel) refresh() {
 	})
 }
 
+// refreshPartitions 加载所选 Topic 的分区列表，并恢复上次选择的分区。
 func (p *messagesPanel) refreshPartitions() {
 	name := p.topicSel.Selected()
 	if name == "" {
@@ -324,6 +333,7 @@ func (p *messagesPanel) refreshPartitions() {
 	})
 }
 
+// applyMsgFilter 按 Key/Value 子串过滤消息列表。
 func (p *messagesPanel) applyMsgFilter() {
 	kq, vq := "", ""
 	if p.keyFilter != nil {
@@ -341,6 +351,7 @@ func (p *messagesPanel) applyMsgFilter() {
 	}
 }
 
+// onCancelFetch 取消当前消息拉取。
 func (p *messagesPanel) onCancelFetch() {
 	if p.fetchCancel != nil {
 		p.statusLbl.SetText("正在取消...")
@@ -349,10 +360,12 @@ func (p *messagesPanel) onCancelFetch() {
 	}
 }
 
+// onFetch 处理「拉取消息」按钮点击，手动触发拉取。
 func (p *messagesPanel) onFetch() {
 	p.fetch(false)
 }
 
+// fetch 执行消息拉取。auto=true 表示自动触发（如选中 Topic 后），不弹错误提示。
 func (p *messagesPanel) fetch(auto bool) {
 	topic := p.topicSel.Selected()
 	partStr := p.partSel.Selected
@@ -469,6 +482,7 @@ func (p *messagesPanel) fetch(auto bool) {
 	})
 }
 
+// showMessageDetail 弹出消息详情对话框，展示 Key/Value/Headers。
 func (p *messagesPanel) showMessageDetail(m core.MessageInfo) {
 	keyE := widget.NewMultiLineEntry()
 	keyE.SetText(core.FormatPayload(m.Key))
@@ -501,6 +515,7 @@ func (p *messagesPanel) showMessageDetail(m core.MessageInfo) {
 	dlg.Show()
 }
 
+// onProduce 弹出「发送消息」对话框。
 func (p *messagesPanel) onProduce() {
 	if len(p.topics) == 0 {
 		showInfo(p.win, "提示", "请先刷新 Topic 列表")
@@ -562,6 +577,7 @@ func (p *messagesPanel) onProduce() {
 }
 
 // exportedMessage 用于 JSON 导出的消息结构。
+// 字段与 MessageInfo 对齐，Key/Value 使用 FormatPayload 格式化。
 type exportedMessage struct {
 	Topic     string            `json:"topic"`
 	Partition int32             `json:"partition"`
@@ -573,6 +589,7 @@ type exportedMessage struct {
 	Size      int               `json:"size"`
 }
 
+// onExport 导出当前过滤后的消息为 JSON 文件。
 func (p *messagesPanel) onExport() {
 	if len(p.allRows) == 0 {
 		showInfo(p.win, "提示", "没有可导出的消息，请先拉取消息")
@@ -634,6 +651,7 @@ func (p *messagesPanel) onExport() {
 }
 
 // parseTimeInput 解析用户输入的时间字符串，支持多种格式。
+// 支持的格式：2026-08-26 12:00:05、2026-08-26 12:00、2026-08-26、2026/08/26 12:00:05 等。
 func parseTimeInput(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	layouts := []string{

@@ -11,6 +11,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// brokersPanel Broker 概览面板，展示集群节点和控制器。
 type brokersPanel struct {
 	win        fyne.Window
 	client     *core.KafkaClient
@@ -22,10 +23,12 @@ type brokersPanel struct {
 	info  *widget.Label
 }
 
+// newBrokersPanel 创建 Broker 面板实例。
 func newBrokersPanel(win fyne.Window, client *core.KafkaClient) *brokersPanel {
 	return &brokersPanel{win: win, client: client}
 }
 
+// build 构建 Broker 面板的 UI 组件和事件绑定。
 func (p *brokersPanel) build() fyne.CanvasObject {
 	p.info = widget.NewLabel("加载中...")
 	p.info.Alignment = fyne.TextAlignCenter
@@ -49,6 +52,7 @@ func (p *brokersPanel) build() fyne.CanvasObject {
 	return container.NewBorder(head, nil, nil, nil, scroll)
 }
 
+// updateCell 渲染 Broker 表格单元格，处理越界行清空。
 func (p *brokersPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	label := obj.(*widget.Label)
 	label.TextStyle = fyne.TextStyle{}
@@ -93,6 +97,7 @@ func (p *brokersPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) 
 	}
 }
 
+// ensureLoaded 确保 Broker 列表已加载，仅首次调用时刷新。
 func (p *brokersPanel) ensureLoaded() {
 	if p.loaded {
 		return
@@ -101,6 +106,7 @@ func (p *brokersPanel) ensureLoaded() {
 	p.refresh()
 }
 
+// refresh 强制刷新 Broker 列表。
 func (p *brokersPanel) refresh() {
 	if p.info == nil {
 		return

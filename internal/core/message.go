@@ -376,6 +376,7 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 	return all, nil
 }
 
+// fetchRange 拉取指定分区的 offset 范围 [from, toEx)，内部创建临时 consumer。
 func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition int32, oldest, hwm, start, end int64, max int) ([]MessageInfo, error) {
 	from, toEx := normalizeFetchRange(oldest, hwm, start, end, max)
 	if from >= toEx {
@@ -472,6 +473,7 @@ func (kc *KafkaClient) ProduceMessage(ctx context.Context, topic string, partiti
 	return r.Partition, r.Offset, nil
 }
 
+// toMessageInfo 将 franz-go Record 转为内部 MessageInfo 结构。
 func toMessageInfo(r *kgo.Record) MessageInfo {
 	info := MessageInfo{
 		Topic:     r.Topic,

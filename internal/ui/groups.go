@@ -13,6 +13,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// groupsPanel 消费组面板，负责列表、Offset/Lag、成员详情和重置。
 type groupsPanel struct {
 	win        fyne.Window
 	client     *core.KafkaClient
@@ -32,10 +33,12 @@ type groupsPanel struct {
 	rows      []core.GroupTopicOffset
 }
 
+// newGroupsPanel 创建消费组面板实例。
 func newGroupsPanel(win fyne.Window, client *core.KafkaClient) *groupsPanel {
 	return &groupsPanel{win: win, client: client}
 }
 
+// build 构建消费组面板的 UI 组件和事件绑定。
 func (p *groupsPanel) build() fyne.CanvasObject {
 	btn := widget.NewButtonWithIcon("刷新", theme.ViewRefreshIcon(), p.refresh)
 	btnLatest := widget.NewButton("重置到最新", func() { p.onReset(core.OffsetResetLatest) })
@@ -106,6 +109,7 @@ func (p *groupsPanel) build() fyne.CanvasObject {
 	return split
 }
 
+// applyFilter 根据搜索框过滤消费组，并处理选中项不可见时的清理。
 func (p *groupsPanel) applyFilter() {
 	q := ""
 	if p.search != nil {
@@ -158,6 +162,7 @@ func (p *groupsPanel) applyFilter() {
 	}
 }
 
+// updateCell 渲染 Offset/Lag 表格单元格，处理越界行清空。
 func (p *groupsPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	label := obj.(*widget.Label)
 	label.Importance = widget.MediumImportance
@@ -212,6 +217,7 @@ func (p *groupsPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	}
 }
 
+// ensureLoaded 确保消费组列表已加载，仅首次调用时刷新。
 func (p *groupsPanel) ensureLoaded() {
 	if p.loaded {
 		return
@@ -220,6 +226,7 @@ func (p *groupsPanel) ensureLoaded() {
 	p.refresh()
 }
 
+// refresh 强制刷新消费组列表。
 func (p *groupsPanel) refresh() {
 	p.refreshSeq++
 	seq := p.refreshSeq
@@ -241,6 +248,7 @@ func (p *groupsPanel) refresh() {
 	})
 }
 
+// refreshOffsets 加载所选消费组的 Offset/Lag 和成员详情。
 func (p *groupsPanel) refreshOffsets() {
 	group := p.selected
 	if group == "" {
@@ -307,6 +315,7 @@ func formatGroupMembers(d *core.GroupDetail) string {
 	return sb.String()
 }
 
+// onReset 处理「重置 Offset」按钮，重置到最新或最早。
 func (p *groupsPanel) onReset(to string) {
 	if p.selected == "" {
 		showInfo(p.win, "提示", "请先选择消费组")

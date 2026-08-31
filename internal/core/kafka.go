@@ -130,12 +130,14 @@ func (kc *KafkaClient) Close() {
 	}
 }
 
+// invalidateTopics 清除 Topic 名称缓存，下次 ListTopicNames 会强制刷新。
 func (kc *KafkaClient) invalidateTopics() {
 	kc.topicMu.Lock()
 	kc.topicNames = nil
 	kc.topicMu.Unlock()
 }
 
+// alive 检查客户端是否已关闭，或 context 是否已取消。
 func (kc *KafkaClient) alive(ctx context.Context) error {
 	if err := ctxErr(ctx); err != nil {
 		return err
@@ -148,6 +150,7 @@ func (kc *KafkaClient) alive(ctx context.Context) error {
 	return nil
 }
 
+// beginFetch 标记一次拉取开始，Close 会等待所有拉取完成。
 func (kc *KafkaClient) beginFetch(ctx context.Context) error {
 	if err := ctxErr(ctx); err != nil {
 		return err
@@ -210,6 +213,7 @@ func (kc *KafkaClient) BrokerCount(ctx context.Context) int {
 	return len(meta.Brokers)
 }
 
+// parseBrokers 解析逗号分隔的 broker 地址字符串。
 func parseBrokers(s string) []string {
 	var out []string
 	for _, b := range strings.Split(s, ",") {
@@ -221,6 +225,7 @@ func parseBrokers(s string) []string {
 	return out
 }
 
+// ctxErr 返回 context 的错误，nil context 返回 nil。
 func ctxErr(ctx context.Context) error {
 	if ctx == nil {
 		return nil

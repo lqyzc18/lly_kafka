@@ -16,6 +16,7 @@ import (
 )
 
 // topicsPanel Topic 列表与详情 Tab。
+// topicsPanel Topic 管理面板，负责列表、详情、新建、删除、扩分区和改配置。
 type topicsPanel struct {
 	win        fyne.Window
 	client     *core.KafkaClient
@@ -35,10 +36,12 @@ type topicsPanel struct {
 }
 
 // newTopicsPanel 构造 Topic Tab。
+// newTopicsPanel 创建 Topic 面板实例。
 func newTopicsPanel(win fyne.Window, client *core.KafkaClient) *topicsPanel {
 	return &topicsPanel{win: win, client: client, topics: []string{}, filtered: []string{}}
 }
 
+// build 构建 Topic 面板的 UI 组件和事件绑定。
 func (p *topicsPanel) build() fyne.CanvasObject {
 	// 顶部工具条
 	btnRefresh := widget.NewButtonWithIcon("刷新列表", theme.ViewRefreshIcon(), p.refresh)
@@ -118,6 +121,7 @@ func (p *topicsPanel) build() fyne.CanvasObject {
 	return container.NewBorder(top, nil, nil, nil, split)
 }
 
+// updatePartCell 渲染分区详情表格单元格，处理越界行清空。
 func (p *topicsPanel) updatePartCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	label := obj.(*widget.Label)
 	label.Importance = widget.MediumImportance
@@ -171,6 +175,7 @@ func (p *topicsPanel) updatePartCell(id widget.TableCellID, obj fyne.CanvasObjec
 	}
 }
 
+// formatInts 将 int32 切片格式化为逗号分隔字符串。
 func formatInts(xs []int32) string {
 	ss := make([]string, 0, len(xs))
 	for _, x := range xs {
@@ -179,7 +184,7 @@ func formatInts(xs []int32) string {
 	return strings.Join(ss, ",")
 }
 
-// applyFilter 根据搜索框过滤 Topic。
+// applyFilter 根据搜索框过滤 Topic，并处理选中项不可见时的清理。
 func (p *topicsPanel) applyFilter() {
 	q := ""
 	if p.search != nil {
@@ -204,6 +209,7 @@ func (p *topicsPanel) applyFilter() {
 	}
 }
 
+// ensureLoaded 确保 Topic 列表已加载，仅首次调用时刷新。
 func (p *topicsPanel) ensureLoaded() {
 	if p.loaded {
 		return
@@ -212,6 +218,7 @@ func (p *topicsPanel) ensureLoaded() {
 	p.refresh()
 }
 
+// refresh 强制刷新 Topic 列表。
 func (p *topicsPanel) refresh() {
 	p.refreshSeq++
 	seq := p.refreshSeq
@@ -233,7 +240,7 @@ func (p *topicsPanel) refresh() {
 	})
 }
 
-// onSelect 选择 Topic 后加载详情。
+// onSelect 处理 Topic 选中事件，触发详情加载。
 func (p *topicsPanel) onSelect(name string) {
 	p.selected = name
 	p.refreshDetail()

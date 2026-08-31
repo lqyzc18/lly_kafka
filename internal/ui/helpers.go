@@ -85,6 +85,7 @@ func applyCJKTheme(a fyne.App) {
 	a.Settings().SetTheme(cjkTheme{base: theme.DefaultTheme()})
 }
 
+// showError 弹出错误对话框并记录日志。
 func showError(w fyne.Window, title string, err error) {
 	if err == nil {
 		return
@@ -93,10 +94,13 @@ func showError(w fyne.Window, title string, err error) {
 	dialog.ShowError(fmt.Errorf("%s: %v", title, err), w)
 }
 
+// showInfo 弹出信息对话框。
 func showInfo(w fyne.Window, title, msg string) {
 	dialog.ShowInformation(title, msg, w)
 }
 
+// fetchAndShow 异步加载数据并在 UI 线程显示结果。
+// ctx 用于在客户端关闭后丢弃过期回调。
 func fetchAndShow[T any](ctx context.Context, load func() (T, error), show func(val T, err error)) {
 	go func() {
 		val, err := load()
@@ -109,6 +113,8 @@ func fetchAndShow[T any](ctx context.Context, load func() (T, error), show func(
 	}()
 }
 
+// previewBytes 将字节切片转为可显示的预览字符串。
+// 超过 max 字符截断，控制字符转为转义序列，二进制数据转为 hex。
 func previewBytes(b []byte, max int) string {
 	if b == nil {
 		return "null"

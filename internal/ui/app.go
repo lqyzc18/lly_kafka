@@ -15,6 +15,7 @@ import (
 	"github.com/gogf/gf/v2/frame/g"
 )
 
+// MainWindow 主窗口，管理连接状态、Tab 容器和全局事件。
 type MainWindow struct {
 	fyneApp fyne.App
 	win     fyne.Window
@@ -22,8 +23,8 @@ type MainWindow struct {
 	store   *core.ConnectionStore
 
 	mu          sync.Mutex
-	connectSeq  uint64
-	testSeq     uint64
+	connectSeq  uint64 // 连接序号，用于丢弃过期回调
+	testSeq     uint64 // 测试连接序号
 	client      *core.KafkaClient
 	conn        *core.Connection
 	windowCtx   context.Context
@@ -112,6 +113,7 @@ func Run() {
 	w.ShowAndRun()
 }
 
+// build 构建主窗口的 toolbar 和 body。
 func (mw *MainWindow) build() {
 	mw.connSel = widget.NewSelect(mw.store.Names(), nil)
 	names := mw.store.Names()
@@ -142,6 +144,7 @@ func (mw *MainWindow) build() {
 	mw.root = container.NewBorder(mw.toolbar, nil, nil, nil, mw.body)
 }
 
+// placeholder 返回未连接时的占位界面。
 func (mw *MainWindow) placeholder() fyne.CanvasObject {
 	icon := widget.NewIcon(theme.ComputerIcon())
 	title := widget.NewLabelWithStyle("请先选择连接并点击「连接」", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
@@ -149,12 +152,14 @@ func (mw *MainWindow) placeholder() fyne.CanvasObject {
 	return container.NewCenter(container.NewVBox(icon, title, hint))
 }
 
+// setStatus 更新状态栏文本和重要性颜色。
 func (mw *MainWindow) setStatus(text string, imp widget.Importance) {
 	mw.status.SetText(text)
 	mw.status.Importance = imp
 	mw.status.Refresh()
 }
 
+// showDisconnected 切换到未连接状态，恢复连接按钮和下拉。
 func (mw *MainWindow) showDisconnected() {
 	if mw.connSel != nil {
 		mw.connSel.Enable()
@@ -166,11 +171,13 @@ func (mw *MainWindow) showDisconnected() {
 	mw.body.Refresh()
 }
 
+// bumpSeqLocked 递增连接序号，使旧回调失效。调用方需持锁。
 func (mw *MainWindow) bumpSeqLocked() uint64 {
 	mw.connectSeq++
 	return mw.connectSeq
 }
 
+// beginTest 开始一次连接测试，返回 context 和序号。
 func (mw *MainWindow) beginTest() (context.Context, uint64) {
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
@@ -178,24 +185,28 @@ func (mw *MainWindow) beginTest() (context.Context, uint64) {
 	return mw.windowCtx, mw.testSeq
 }
 
+// testCurrent 检查测试回调是否过期。
 func (mw *MainWindow) testCurrent(seq uint64) bool {
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
 	return mw.windowCtx.Err() == nil && mw.testSeq == seq
 }
 
+// connected 返回当前是否有有效连接。
 func (mw *MainWindow) connected() bool {
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
 	return mw.client != nil
 }
 
+// takeClientLocked 取走当前 client 并清空引用。调用方需持锁。
 func (mw *MainWindow) takeClientLocked() *core.KafkaClient {
 	c := mw.client
 	mw.client, mw.conn = nil, nil
 	return c
 }
 
+// onConnect 处理「连接」按钮点击，异步创建 Kafka 客户端。
 func (mw *MainWindow) onConnect() {
 	name := mw.connSel.Selected
 	if name == "" {
@@ -277,6 +288,7 @@ func (mw *MainWindow) onConnect() {
 	}()
 }
 
+// onDisconnect 处理「断开」按钮点击，关闭当前连接。
 func (mw *MainWindow) onDisconnect() {
 	mw.mu.Lock()
 	mw.bumpSeqLocked()
@@ -293,6 +305,7 @@ func (mw *MainWindow) onDisconnect() {
 	mw.showDisconnected()
 }
 
+// refreshBody 根据连接状态切换 body 内容。
 func (mw *MainWindow) refreshBody() {
 	mw.mu.Lock()
 	client := mw.client
@@ -305,6 +318,7 @@ func (mw *MainWindow) refreshBody() {
 	mw.body.Refresh()
 }
 
+// buildTabs 创建主界面的四个 Tab：集群、Topic、消息、消费组。
 func (mw *MainWindow) buildTabs(client *core.KafkaClient) fyne.CanvasObject {
 	connName := ""
 	if mw.conn != nil {

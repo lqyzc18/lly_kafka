@@ -18,6 +18,8 @@ type filterSelect struct {
 	updating bool
 }
 
+// newFilterSelect 创建带筛选的下拉选择。
+// placeholder 是筛选输入框的提示文本，onChange 在选中项变化时调用。
 func newFilterSelect(placeholder string, onChange func(string)) *filterSelect {
 	f := &filterSelect{onChange: onChange, all: []string{}}
 	f.filter = widget.NewEntry()
@@ -40,22 +42,27 @@ func newFilterSelect(placeholder string, onChange func(string)) *filterSelect {
 	return f
 }
 
+// object 返回组合后的 UI 对象（筛选框 + 下拉）。
 func (f *filterSelect) object() fyne.CanvasObject {
 	return container.NewVBox(f.filter, f.sel)
 }
 
+// filterWidget 返回筛选输入框，用于单独布局。
 func (f *filterSelect) filterWidget() fyne.CanvasObject {
 	return f.filter
 }
 
+// selectWidget 返回下拉选择框，用于单独布局。
 func (f *filterSelect) selectWidget() fyne.CanvasObject {
 	return f.sel
 }
 
+// Selected 返回当前选中的值。
 func (f *filterSelect) Selected() string {
 	return f.selected
 }
 
+// SetOptions 更新选项列表，若当前选中项不在新列表中则清空。
 func (f *filterSelect) SetOptions(names []string) {
 	f.all = append([]string(nil), names...)
 	if f.selected != "" && !contains(f.all, f.selected) {
@@ -64,6 +71,7 @@ func (f *filterSelect) SetOptions(names []string) {
 	f.syncOptions()
 }
 
+// SetSelected 设置选中项，仅当值在选项列表中才生效。
 func (f *filterSelect) SetSelected(name string) {
 	if name != "" && len(f.all) > 0 && !contains(f.all, name) {
 		return
@@ -76,6 +84,8 @@ func (f *filterSelect) SetSelected(name string) {
 	}
 }
 
+// syncOptions 根据筛选文本同步下拉选项。
+// 若当前选中项仍匹配筛选结果，保持选中；否则清空选中并更新提示。
 func (f *filterSelect) syncOptions() {
 	opts := filterTopics(f.all, f.filter.Text)
 	f.updating = true
@@ -96,6 +106,7 @@ func (f *filterSelect) syncOptions() {
 	f.updating = false
 }
 
+// pickUniqueOrExact 回车时选中唯一匹配或精确匹配项。
 func (f *filterSelect) pickUniqueOrExact() {
 	q := strings.TrimSpace(f.filter.Text)
 	opts := filterTopics(f.all, q)
