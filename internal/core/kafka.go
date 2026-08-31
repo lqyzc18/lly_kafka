@@ -63,7 +63,9 @@ func NewKafkaClient(ctx context.Context, conn *Connection) (*KafkaClient, error)
 	}
 	cfg.Net.DialTimeout = 8 * time.Second
 	cfg.Net.ReadTimeout = 15 * time.Second
-	cfg.Metadata.Full = false
+	// Full=false 时 NewClusterAdminFromClient 无法获取 Controller。
+	cfg.Metadata.Full = true
+	cfg.Metadata.AllowAutoTopicCreation = false
 	cfg.Metadata.Timeout = 10 * time.Second
 
 	if err := applySecurity(cfg, conn); err != nil {
