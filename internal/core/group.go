@@ -146,6 +146,10 @@ func (kc *KafkaClient) GroupOffsets(ctx context.Context, group string) ([]GroupT
 				Partition:   partition,
 				GroupOffset: pl.Commit.At,
 			}
+			if pl.Err != nil {
+				// Commit 或 End 拉取失败，标记为未提交
+				row.GroupOffset = -1
+			}
 			row.LogEndOffset = pl.End.Offset
 			row.Lag = computeGroupLag(row.GroupOffset, row.LogEndOffset)
 			out = append(out, row)

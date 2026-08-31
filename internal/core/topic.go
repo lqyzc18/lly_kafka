@@ -130,18 +130,21 @@ func (kc *KafkaClient) TopicDetail(ctx context.Context, name string) (*TopicInfo
 	sort.Slice(info.Partitions, func(i, j int) bool { return info.Partitions[i].ID < info.Partitions[j].ID })
 
 	// 拉取配置
-	if cfgs, err := kc.admin.DescribeTopicConfigs(ctx, name); err == nil {
-		if len(cfgs) > 0 {
-			m := make(map[string]string)
-			for _, c := range cfgs[0].Configs {
-				if !c.Sensitive {
-					m[c.Key] = c.MaybeValue()
-				} else {
-					m[c.Key] = "(sensitive)"
-				}
+	cfgs, err := kc.admin.DescribeTopicConfigs(ctx, name)
+	if err != nil {
+		// 配置拉取失败不致命，仅记录
+		g.Log().Warningf(ctx, "拉取 Topic %s 配置失败: %v", name, err)
+	}
+	if len(cfgs) > 0 {
+		m := make(map[string]string)
+		for _, c := range cfgs[0].Configs {
+			if !c.Sensitive {
+				m[c.Key] = c.MaybeValue()
+			} else {
+				m[c.Key] = "(sensitive)"
 			}
-			info.Configs = m
 		}
+		info.Configs = m
 	}
 	return info, nil
 }

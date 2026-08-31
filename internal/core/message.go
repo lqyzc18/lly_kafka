@@ -102,11 +102,31 @@ func (kc *KafkaClient) GetOffsetByTime(ctx context.Context, topic string, partit
 	if t.IsZero() {
 		return oldest, nil
 	}
-	// franz-go 没有直接按时间查 offset 的 API，用 ListMaxTimestampOffsets 或手动二分。
-	// 这里用简化策略：返回 oldest（从最早开始消费，让用户手动过滤）。
-	// 更精确的实现需要二分查找，但管理工具场景下从 oldest 开始过滤已够用。
-	_ = hwm // 保留参数，未来可优化为二分
-	return oldest, nil
+	// franz-go 没有直接按时间查 offset 的 API，用二分查找。
+	// 先尝试从 oldest 开始读一条，如果该消息时间已晚于 t，直接返回 oldest。
+	// 否则用二分查找定位。
+	if hwm <= oldest {
+		return oldest, nil
+	}
+
+	// 二分查找：找到第一个 timestamp >= t 的 offset
+	left, right := oldest, hwm
+	for left < right {
+		mid := left + (right-left)/2
+		// 读一条消息看时间戳
+		msgs, err := kc.FetchMessages(ctx, topic, partition, mid, mid+1, 1)
+		if err != nil || len(msgs) == 0 {
+			// 读不到，往右找
+			left = mid + 1
+			continue
+		}
+		if msgs[0].Timestamp.After(t) || msgs[0].Timestamp.Equal(t) {
+			right = mid
+		} else {
+			left = mid + 1
+		}
+	}
+	return left, nil
 }
 
 func (kc *KafkaClient) oldestAndNewest(ctx context.Context, topic string, partition int32) (oldest, hwm int64, err error) {
@@ -375,12 +395,17 @@ func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition i
 	}
 
 	// 复用现有 client 的连接配置，创建临时 consumer
-	tempClient, err := kgo.NewClient(
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(parseBrokers(kc.conn.Brokers)...),
 		kgo.ClientID(kc.conn.ClientID),
 		kgo.ConsumePartitions(offsets),
-		kgo.FetchMaxWait(500*time.Millisecond), // 快速返回，不阻塞
-	)
+		kgo.FetchMaxWait(500 * time.Millisecond), // 快速返回，不阻塞
+	}
+	// 复制安全设置
+	if err := applySecurity(&opts, kc.conn); err != nil {
+		return nil, err
+	}
+	tempClient, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("创建临时 consumer 失败: %w", err)
 	}
