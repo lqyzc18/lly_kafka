@@ -31,7 +31,7 @@ type messagesPanel struct {
 	loaded   bool
 
 	topics   []string
-	topicSel *widget.Select
+	topicSel *filterSelect
 	partSel  *widget.Select
 
 	mode       *widget.RadioGroup
@@ -47,12 +47,13 @@ type messagesPanel struct {
 	btnExport  *widget.Button
 	statusLbl  *widget.Label
 
-	table       *widget.Table
-	allRows     []core.MessageInfo
-	rows        []core.MessageInfo
-	fetchCancel context.CancelFunc
-	fetchSeq    uint64
-	restorePart string
+	table        *widget.Table
+	allRows      []core.MessageInfo
+	rows         []core.MessageInfo
+	fetchCancel  context.CancelFunc
+	fetchSeq     uint64
+	restorePart  string
+	partUpdating bool
 }
 
 func newMessagesPanel(win fyne.Window, client *core.KafkaClient, cfg *core.AppConfig, prefs fyne.Preferences, connName string) *messagesPanel {
@@ -67,7 +68,7 @@ func (p *messagesPanel) prefKey(kind string) string {
 }
 
 func (p *messagesPanel) build() fyne.CanvasObject {
-	p.topicSel = widget.NewSelect([]string{}, func(s string) {
+	p.topicSel = newFilterSelect("筛选 Topic", func(s string) {
 		if p.prefs != nil && p.connName != "" && s != "" {
 			p.prefs.SetString(p.prefKey("topic"), s)
 		}
@@ -76,6 +77,9 @@ func (p *messagesPanel) build() fyne.CanvasObject {
 	p.partSel = widget.NewSelect([]string{}, func(s string) {
 		if p.prefs != nil && p.connName != "" && s != "" {
 			p.prefs.SetString(p.prefKey("part"), s)
+		}
+		if !p.partUpdating && s != "" {
+			p.fetch(true)
 		}
 	})
 
@@ -133,8 +137,9 @@ func (p *messagesPanel) build() fyne.CanvasObject {
 	}
 
 	form := container.NewVBox(
+		p.topicSel.filterWidget(),
 		container.NewGridWithColumns(2,
-			widget.NewLabel("Topic:"), p.topicSel,
+			widget.NewLabel("Topic:"), p.topicSel.selectWidget(),
 			widget.NewLabel("分区:"), p.partSel,
 		),
 		container.NewHBox(widget.NewLabel("模式:"), p.mode),
@@ -182,6 +187,7 @@ func (p *messagesPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject)
 		return
 	}
 	if id.Row-1 >= len(p.rows) {
+		label.SetText("")
 		return
 	}
 	m := p.rows[id.Row-1]
@@ -233,23 +239,20 @@ func (p *messagesPanel) updateModeFields() {
 }
 
 func (p *messagesPanel) ensureLoaded() {
-	if p.loaded {
-		return
-	}
 	p.loaded = true
 	p.refresh()
 }
 
 func (p *messagesPanel) refresh() {
 	fetchAndShow(p.client.Context(), func() ([]string, error) {
-		return p.client.ListTopicNames(p.client.Context())
+		return p.client.RefreshTopicNames(p.client.Context())
 	}, func(names []string, err error) {
 		if err != nil {
 			showError(p.win, "获取 Topic 失败", err)
 			return
 		}
 		p.topics = names
-		p.topicSel.Options = names
+		p.topicSel.SetOptions(names)
 		if len(names) == 0 {
 			p.topicSel.SetSelected("")
 			p.partSel.Options = []string{}
@@ -271,18 +274,33 @@ func (p *messagesPanel) refresh() {
 }
 
 func (p *messagesPanel) refreshPartitions() {
-	name := p.topicSel.Selected
+	name := p.topicSel.Selected()
 	if name == "" {
 		return
+	}
+	if p.btnFetch != nil {
+		p.btnFetch.Disable()
+	}
+	if p.statusLbl != nil {
+		p.statusLbl.SetText("加载分区...")
 	}
 	fetchAndShow(p.client.Context(), func() (int, error) {
 		return p.client.PartitionCount(p.client.Context(), name)
 	}, func(n int, err error) {
 		if err != nil {
+			if p.topicSel.Selected() != name {
+				return
+			}
+			if p.btnFetch != nil {
+				p.btnFetch.Enable()
+			}
+			if p.statusLbl != nil {
+				p.statusLbl.SetText("加载分区失败")
+			}
 			showError(p.win, "获取分区数失败", err)
 			return
 		}
-		if p.topicSel.Selected != name {
+		if p.topicSel.Selected() != name {
 			return
 		}
 		opts := make([]string, 0, n+1)
@@ -290,6 +308,7 @@ func (p *messagesPanel) refreshPartitions() {
 		for i := 0; i < n; i++ {
 			opts = append(opts, strconv.Itoa(i))
 		}
+		p.partUpdating = true
 		p.partSel.Options = opts
 		want := p.restorePart
 		p.restorePart = ""
@@ -297,6 +316,11 @@ func (p *messagesPanel) refreshPartitions() {
 			want = partAll
 		}
 		p.partSel.SetSelected(want)
+		p.partUpdating = false
+		if p.btnFetch != nil {
+			p.btnFetch.Enable()
+		}
+		p.fetch(true)
 	})
 }
 
@@ -326,10 +350,16 @@ func (p *messagesPanel) onCancelFetch() {
 }
 
 func (p *messagesPanel) onFetch() {
-	topic := p.topicSel.Selected
+	p.fetch(false)
+}
+
+func (p *messagesPanel) fetch(auto bool) {
+	topic := p.topicSel.Selected()
 	partStr := p.partSel.Selected
 	if topic == "" || partStr == "" {
-		showInfo(p.win, "提示", "请选择 Topic 和分区")
+		if !auto {
+			showInfo(p.win, "提示", "请选择 Topic 和分区")
+		}
 		return
 	}
 	allParts := partStr == partAll
@@ -344,19 +374,25 @@ func (p *messagesPanel) onFetch() {
 	start := gconv.Int64(p.startE.Text)
 	end := gconv.Int64(p.endE.Text)
 	if !latest && !byTime && end > 0 && end < start {
-		showInfo(p.win, "提示", "结束 offset 应大于或等于起始 offset")
+		if !auto {
+			showInfo(p.win, "提示", "结束 offset 应大于或等于起始 offset")
+		}
 		return
 	}
 	var startTime time.Time
 	if byTime {
 		ts := strings.TrimSpace(p.timeE.Text)
 		if ts == "" {
-			showInfo(p.win, "提示", "请输入起始时间")
+			if !auto {
+				showInfo(p.win, "提示", "请输入起始时间")
+			}
 			return
 		}
 		t, err := parseTimeInput(ts)
 		if err != nil {
-			showInfo(p.win, "提示", "时间格式无效，请使用 2026-08-26 12:00:00 或 2026-08-26")
+			if !auto {
+				showInfo(p.win, "提示", "时间格式无效，请使用 2026-08-26 12:00:00 或 2026-08-26")
+			}
 			return
 		}
 		startTime = t
@@ -470,8 +506,9 @@ func (p *messagesPanel) onProduce() {
 		showInfo(p.win, "提示", "请先刷新 Topic 列表")
 		return
 	}
-	topicSel := widget.NewSelect(p.topics, nil)
-	topicSel.SetSelected(p.topicSel.Selected)
+	topicSel := newFilterSelect("筛选 Topic", nil)
+	topicSel.SetOptions(p.topics)
+	topicSel.SetSelected(p.topicSel.Selected())
 	partE := widget.NewEntry()
 	partE.SetText("-1")
 	keyE := widget.NewEntry()
@@ -483,19 +520,21 @@ func (p *messagesPanel) onProduce() {
 	headersE.SetPlaceHolder("k1=v1,k2=v2 (可选)")
 
 	items := []*widget.FormItem{
-		{Text: "Topic", Widget: topicSel},
+		{Text: "Topic", Widget: topicSel.object()},
 		{Text: "分区 (留空或-1为自动)", Widget: partE},
 		{Text: "Key", Widget: keyE},
 		{Text: "Value", Widget: valE},
 		{Text: "Headers", Widget: headersE},
 	}
-	d := dialog.NewForm("发送消息", "发送", "取消", items, func(ok bool) {
+	var d dialog.Dialog
+	d = dialog.NewForm("发送消息", "发送", "取消", items, func(ok bool) {
 		if !ok {
 			return
 		}
-		topic := topicSel.Selected
+		topic := topicSel.Selected()
 		if topic == "" {
 			showInfo(p.win, "提示", "请选择 Topic")
+			d.Show()
 			return
 		}
 		hdrs := parseKV(headersE.Text)

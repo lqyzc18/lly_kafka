@@ -3,6 +3,8 @@ package ui
 import (
 	"reflect"
 	"testing"
+
+	"fyne.io/fyne/v2/test"
 )
 
 func TestFilterTopicsCopyAndMatch(t *testing.T) {
@@ -28,5 +30,53 @@ func TestFilterTopicsCopyAndMatch(t *testing.T) {
 	}
 	if src2[0] != "a" || src2[1] != "ab" || src2[2] != "c" {
 		t.Fatalf("source corrupted: %v", src2)
+	}
+}
+
+func TestFilterSelectUniqueMatchAndKeepSelection(t *testing.T) {
+	a := test.NewApp()
+	defer a.Quit()
+
+	var got []string
+	f := newFilterSelect("筛选 Topic", func(s string) { got = append(got, s) })
+	f.SetOptions([]string{"orders", "payments", "user-events"})
+	f.SetSelected("orders")
+	if f.Selected() != "orders" {
+		t.Fatalf("selected: %s", f.Selected())
+	}
+	if len(got) != 1 || got[0] != "orders" {
+		t.Fatalf("onchange: %v", got)
+	}
+
+	f.filter.SetText("USER")
+	if f.Selected() != "orders" {
+		t.Fatalf("typing should not auto-select, got %s", f.Selected())
+	}
+	if !reflect.DeepEqual(f.sel.Options, []string{"user-events"}) {
+		t.Fatalf("filtered options: %v", f.sel.Options)
+	}
+
+	f.pickUniqueOrExact()
+	if f.Selected() != "user-events" {
+		t.Fatalf("enter unique match: %s", f.Selected())
+	}
+	if len(got) != 2 || got[1] != "user-events" {
+		t.Fatalf("unique onchange: %v", got)
+	}
+
+	f.filter.SetText("zzz")
+	if f.Selected() != "user-events" {
+		t.Fatalf("no match should keep selected, got %s", f.Selected())
+	}
+	if len(f.sel.Options) != 0 {
+		t.Fatalf("no match options: %v", f.sel.Options)
+	}
+
+	f.filter.SetText("")
+	if !reflect.DeepEqual(f.sel.Options, []string{"orders", "payments", "user-events"}) {
+		t.Fatalf("cleared filter options: %v", f.sel.Options)
+	}
+	if f.Selected() != "user-events" {
+		t.Fatalf("cleared filter selected: %s", f.Selected())
 	}
 }

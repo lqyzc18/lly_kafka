@@ -199,20 +199,31 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 		title = "编辑连接 - " + editing.Name
 	}
 
-	d := dialog.NewForm(title, "保存", "取消", formItems, func(ok bool) {
+	var d dialog.Dialog
+	d = dialog.NewForm(title, "保存", "取消", formItems, func(ok bool) {
 		if !ok {
 			return
 		}
 		conn := collect()
 		if conn.Name == "" || conn.Brokers == "" {
 			showInfo(mw.win, "提示", "名称和 Broker 地址不能为空")
+			d.Show()
 			return
 		}
 		if err := mw.store.Upsert(conn); err != nil {
 			showError(mw.win, "保存连接失败", err)
+			d.Show()
 			return
 		}
+		reconnect := false
+		mw.mu.Lock()
+		reconnect = mw.client != nil && mw.conn != nil && mw.conn.Name == conn.Name
+		mw.mu.Unlock()
 		mw.refreshConnSel()
+		if reconnect {
+			mw.connSel.SetSelected(conn.Name)
+			mw.onConnect()
+		}
 	}, mw.win)
 	d.Resize(fyne.NewSize(560, 640))
 	d.Show()

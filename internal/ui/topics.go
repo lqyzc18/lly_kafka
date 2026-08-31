@@ -143,6 +143,7 @@ func (p *topicsPanel) updatePartCell(id widget.TableCellID, obj fyne.CanvasObjec
 		return
 	}
 	if id.Row-1 >= len(p.parts) {
+		label.SetText("")
 		return
 	}
 	part := p.parts[id.Row-1]
@@ -308,13 +309,15 @@ func (p *topicsPanel) onCreate() {
 		{Text: "副本因子", Widget: rfE},
 		{Text: "配置", Widget: configsE},
 	}
-	d := dialog.NewForm("新建 Topic", "创建", "取消", items, func(ok bool) {
+	var d dialog.Dialog
+	d = dialog.NewForm("新建 Topic", "创建", "取消", items, func(ok bool) {
 		if !ok {
 			return
 		}
 		name := strings.TrimSpace(nameE.Text)
 		if name == "" {
 			showInfo(p.win, "提示", "名称不能为空")
+			d.Show()
 			return
 		}
 		partsN := gconv.Int32(strings.TrimSpace(partsE.Text))
@@ -391,13 +394,15 @@ func (p *topicsPanel) onExpand() {
 		{Text: "目标分区数", Widget: countE},
 	}
 	name := p.selected
-	d := dialog.NewForm("扩容分区 - "+name, "扩容", "取消", items, func(ok bool) {
+	var d dialog.Dialog
+	d = dialog.NewForm("扩容分区 - "+name, "扩容", "取消", items, func(ok bool) {
 		if !ok {
 			return
 		}
 		n := gconv.Int32(strings.TrimSpace(countE.Text))
 		if n <= cur {
 			showInfo(p.win, "提示", fmt.Sprintf("目标分区数必须大于当前 %d", cur))
+			d.Show()
 			return
 		}
 		go func() {
@@ -430,13 +435,15 @@ func (p *topicsPanel) onAlterConfig() {
 		{Text: "配置", Widget: cfgE},
 	}
 	name := p.selected
-	d := dialog.NewForm("修改 Topic 配置 - "+name, "提交", "取消", items, func(ok bool) {
+	var d dialog.Dialog
+	d = dialog.NewForm("修改 Topic 配置 - "+name, "提交", "取消", items, func(ok bool) {
 		if !ok {
 			return
 		}
 		cfgs := parseKV(cfgE.Text)
 		if len(cfgs) == 0 {
 			showInfo(p.win, "提示", "请填写 k=v 配置")
+			d.Show()
 			return
 		}
 		go func() {

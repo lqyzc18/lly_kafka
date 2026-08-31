@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -28,7 +27,7 @@ func (e PartitionError) Error() string {
 
 // PartitionErrors 聚合多个分区错误，便于 UI 层展示部分失败详情。
 type PartitionErrors struct {
-	Total   int
+	Total    int
 	Failures []PartitionError
 }
 
@@ -233,9 +232,7 @@ func (kc *KafkaClient) FetchMessages(ctx context.Context, topic string, partitio
 	return kc.fetchRange(ctx, topic, partition, oldest, hwm, start, end, max)
 }
 
-const AllPartitions int32 = -1
-
-// FetchLatestAll 在 partition == AllPartitions 时拉取该 Topic 全部分区的最新 n 条（合计不超过 max）。
+// FetchLatestAll 拉取该 Topic 全部分区的最新 n 条（合计不超过 max）。
 func (kc *KafkaClient) FetchLatestAll(ctx context.Context, topic string, n, max int) ([]MessageInfo, error) {
 	if ctx == nil {
 		ctx = kc.Context()
@@ -350,79 +347,6 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 		return all, partErrs
 	}
 	return all, nil
-}
-
-// StartLiveTail 启动实时消息监听，从最新消息（HWM）开始持续消费新到达的消息并发送到 msgCh。
-func (kc *KafkaClient) StartLiveTail(ctx context.Context, topic string, partition int32, msgCh chan<- MessageInfo, errCh chan<- error) error {
-	if err := kc.alive(ctx); err != nil {
-		return err
-	}
-	consumer, err := kc.getConsumer()
-	if err != nil {
-		return err
-	}
-
-	var partitions []int32
-	if partition == AllPartitions {
-		count, err := kc.PartitionCount(ctx, topic)
-		if err != nil {
-			return err
-		}
-		for i := 0; i < count; i++ {
-			partitions = append(partitions, int32(i))
-		}
-	} else {
-		partitions = []int32{partition}
-	}
-
-	if len(partitions) == 0 {
-		return errors.New("无可用分区")
-	}
-
-	for _, p := range partitions {
-		p := p
-		if err := kc.beginFetch(ctx); err != nil {
-			return err
-		}
-		go func() {
-			defer kc.fetches.Done()
-			pc, err := consumer.ConsumePartition(topic, p, sarama.OffsetNewest)
-			if err != nil {
-				select {
-				case errCh <- fmt.Errorf("分区 %d 监听启动失败: %w", p, err):
-				case <-ctx.Done():
-				}
-				return
-			}
-			defer pc.Close()
-
-			for {
-				select {
-				case m, ok := <-pc.Messages():
-					if !ok {
-						return
-					}
-					select {
-					case msgCh <- toMessageInfo(m):
-					case <-ctx.Done():
-						return
-					}
-				case e, ok := <-pc.Errors():
-					if !ok || e == nil {
-						continue
-					}
-					select {
-					case errCh <- e.Err:
-					case <-ctx.Done():
-						return
-					}
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-	return nil
 }
 
 func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition int32, oldest, hwm, start, end int64, max int) ([]MessageInfo, error) {

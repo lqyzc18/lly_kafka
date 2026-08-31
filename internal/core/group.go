@@ -169,9 +169,7 @@ func (kc *KafkaClient) GroupOffsets(ctx context.Context, group string) ([]GroupT
 			return
 		}
 		item.LogEndOffset = end
-		if end >= item.GroupOffset {
-			item.Lag = end - item.GroupOffset
-		}
+		item.Lag = computeGroupLag(item.GroupOffset, end)
 	})
 	if err := ctxErr(ctx); err != nil {
 		return nil, err
@@ -190,7 +188,18 @@ const (
 	OffsetResetEarliest = "earliest"
 )
 
-// GroupLagSummary 汇总 lag。
+// computeGroupLag 计算滞后量。GroupOffset < 0 表示从未提交，Lag 保持 -1。
+func computeGroupLag(groupOffset, logEnd int64) int64 {
+	if groupOffset < 0 || logEnd < 0 {
+		return -1
+	}
+	if logEnd < groupOffset {
+		return -1
+	}
+	return logEnd - groupOffset
+}
+
+// GroupLagSummary 汇总 lag（忽略未提交 / 未知分区）。
 func GroupLagSummary(rows []GroupTopicOffset) (totalLag int64, lagPartitions int) {
 	for _, r := range rows {
 		if r.Lag > 0 {

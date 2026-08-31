@@ -147,6 +147,9 @@ func (p *groupsPanel) applyFilter() {
 			if p.infoHead != nil {
 				p.infoHead.SetText("请选择消费组")
 			}
+			if p.memberLbl != nil {
+				p.memberLbl.SetText("")
+			}
 			p.rows = nil
 			if p.table != nil {
 				p.table.Refresh()
@@ -176,6 +179,7 @@ func (p *groupsPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 		return
 	}
 	if id.Row-1 >= len(p.rows) {
+		label.SetText("")
 		return
 	}
 	r := p.rows[id.Row-1]
@@ -185,11 +189,21 @@ func (p *groupsPanel) updateCell(id widget.TableCellID, obj fyne.CanvasObject) {
 	case 1:
 		label.SetText(fmt.Sprintf("%d", r.Partition))
 	case 2:
-		label.SetText(fmt.Sprintf("%d", r.GroupOffset))
+		if r.GroupOffset < 0 {
+			label.SetText("-")
+		} else {
+			label.SetText(fmt.Sprintf("%d", r.GroupOffset))
+		}
 	case 3:
-		label.SetText(fmt.Sprintf("%d", r.LogEndOffset))
+		if r.LogEndOffset < 0 {
+			label.SetText("-")
+		} else {
+			label.SetText(fmt.Sprintf("%d", r.LogEndOffset))
+		}
 	case 4:
-		if r.Lag > 0 {
+		if r.GroupOffset < 0 || r.LogEndOffset < 0 || r.Lag < 0 {
+			label.SetText("-")
+		} else if r.Lag > 0 {
 			label.Importance = widget.DangerImportance
 			label.SetText(fmt.Sprintf("⚠ %d", r.Lag))
 		} else {

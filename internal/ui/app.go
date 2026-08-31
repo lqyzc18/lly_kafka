@@ -156,6 +156,9 @@ func (mw *MainWindow) setStatus(text string, imp widget.Importance) {
 }
 
 func (mw *MainWindow) showDisconnected() {
+	if mw.connSel != nil {
+		mw.connSel.Enable()
+	}
 	mw.connBtn.Enable()
 	mw.discBtn.Disable()
 	mw.setStatus("未连接", widget.MediumImportance)
@@ -206,6 +209,9 @@ func (mw *MainWindow) onConnect() {
 	}
 
 	mw.connBtn.Disable()
+	if mw.connSel != nil {
+		mw.connSel.Disable()
+	}
 	mw.discBtn.Enable()
 	mw.setStatus("正在连接...", widget.WarningImportance)
 
@@ -242,6 +248,9 @@ func (mw *MainWindow) onConnect() {
 			if err != nil {
 				connectStop()
 				mw.connBtn.Enable()
+				if mw.connSel != nil {
+					mw.connSel.Enable()
+				}
 				mw.discBtn.Disable()
 				mw.setStatus("未连接", widget.DangerImportance)
 				showError(mw.win, "连接失败", err)
@@ -252,6 +261,9 @@ func (mw *MainWindow) onConnect() {
 			mw.conn = conn
 			mw.mu.Unlock()
 			mw.connBtn.Enable()
+			if mw.connSel != nil {
+				mw.connSel.Enable()
+			}
 			mw.discBtn.Enable()
 			sec := conn.Security
 			if sec == "" {
