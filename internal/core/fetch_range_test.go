@@ -28,6 +28,23 @@ func TestLatestStart(t *testing.T) {
 	}
 }
 
+func TestLatestCountRespectsCap(t *testing.T) {
+	for _, tc := range []struct{ n, max, want int }{
+		{100, 10, 10},
+		{5, 10, 5},
+		{0, 10, 10},
+		{1000, 0, defaultFetchMax},
+	} {
+		got := latestCount(tc.n, tc.max)
+		if got != tc.want {
+			t.Fatalf("latestCount(%d, %d) = %d, want %d", tc.n, tc.max, got, tc.want)
+		}
+	}
+	if from := latestStart(0, 100, int64(latestCount(50, 10))); from != 90 {
+		t.Fatalf("最新 50 条受上限 10 限制后应从 90 开始, got %d", from)
+	}
+}
+
 func TestNormalizeFetchRange(t *testing.T) {
 	type tc struct {
 		oldest, hwm, start, end int64

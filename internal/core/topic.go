@@ -49,6 +49,8 @@ func (kc *KafkaClient) RefreshTopicNames(ctx context.Context) ([]string, error) 
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	details, err := kc.admin.ListTopics(ctx)
 	if err != nil {
 		return nil, err
@@ -72,6 +74,8 @@ func (kc *KafkaClient) TopicDetail(ctx context.Context, name string) (*TopicInfo
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	meta, err := kc.admin.Metadata(ctx, name)
 	if err != nil {
 		return nil, err
@@ -275,6 +279,8 @@ func (kc *KafkaClient) PartitionCount(ctx context.Context, name string) (int, er
 	if err := kc.alive(ctx); err != nil {
 		return 0, err
 	}
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	meta, err := kc.admin.Metadata(ctx, name)
 	if err != nil {
 		return 0, err

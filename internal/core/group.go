@@ -50,6 +50,8 @@ func (kc *KafkaClient) ListGroups(ctx context.Context) ([]GroupInfo, error) {
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	listed, err := kc.admin.ListGroups(ctx)
 	if err != nil {
 		return nil, err
@@ -81,6 +83,8 @@ func (kc *KafkaClient) DescribeGroup(ctx context.Context, group string) (*GroupD
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	described, err := kc.admin.DescribeGroups(ctx, group)
 	if err != nil {
 		return nil, err
@@ -128,6 +132,8 @@ func (kc *KafkaClient) GroupOffsets(ctx context.Context, group string) ([]GroupT
 	if err := kc.alive(ctx); err != nil {
 		return nil, err
 	}
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	// 使用 kadm 的 Lag 功能，自动计算 lag
 	lagResp, err := kc.admin.Lag(ctx, group)
 	if err != nil {
@@ -192,6 +198,16 @@ func GroupLagSummary(rows []GroupTopicOffset) (totalLag int64, lagPartitions int
 	return totalLag, lagPartitions
 }
 
+func committedGroupRows(rows []GroupTopicOffset) []GroupTopicOffset {
+	out := make([]GroupTopicOffset, 0, len(rows))
+	for _, row := range rows {
+		if row.GroupOffset >= 0 {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
 // ResetGroupOffsets 将消费组所有已提交分区重置到最新或最早。
 func (kc *KafkaClient) ResetGroupOffsets(ctx context.Context, group, to string) error {
 	if err := kc.alive(ctx); err != nil {
@@ -201,12 +217,16 @@ func (kc *KafkaClient) ResetGroupOffsets(ctx context.Context, group, to string) 
 	if group == "" {
 		return errors.New("消费组不能为空")
 	}
+	if to != OffsetResetLatest && to != OffsetResetEarliest {
+		return fmt.Errorf("不支持的重置位置: %s", to)
+	}
 
 	// 先拉取当前已提交的 offset
 	rows, err := kc.GroupOffsets(ctx, group)
 	if err != nil {
 		return err
 	}
+	rows = committedGroupRows(rows)
 	if len(rows) == 0 {
 		return errors.New("该消费组没有已提交的分区")
 	}

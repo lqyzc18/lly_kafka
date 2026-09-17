@@ -280,8 +280,8 @@ func (mw *MainWindow) onConnect() {
 			if sec == "" {
 				sec = core.SecurityPlaintext
 			}
-			mw.setStatus(fmt.Sprintf("已连接: %s | %s | Kafka %s | %d brokers",
-				conn.Name, sec, client.KafkaVersion(client.Context()), client.BrokerCount(client.Context())), widget.SuccessImportance)
+			mw.setStatus(fmt.Sprintf("已连接: %s | %s | %d brokers | 集群 %s",
+				conn.Name, sec, client.BrokerCount(), clusterLabel(client.ClusterID())), widget.SuccessImportance)
 			mw.fyneApp.Preferences().SetString("last_conn", conn.Name)
 			mw.refreshBody()
 		})

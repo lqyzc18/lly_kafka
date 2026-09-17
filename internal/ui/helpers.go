@@ -99,6 +99,14 @@ func showInfo(w fyne.Window, title, msg string) {
 	dialog.ShowInformation(title, msg, w)
 }
 
+// clusterLabel 返回可展示的集群标识；旧版本 broker 可能不返回集群 ID。
+func clusterLabel(id string) string {
+	if strings.TrimSpace(id) == "" {
+		return "(未知)"
+	}
+	return id
+}
+
 // fetchAndShow 异步加载数据并在 UI 线程显示结果。
 // ctx 用于在客户端关闭后丢弃过期回调。
 func fetchAndShow[T any](ctx context.Context, load func() (T, error), show func(val T, err error)) {

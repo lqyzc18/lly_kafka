@@ -32,3 +32,15 @@ func TestGroupLagSummarySkipsUncommitted(t *testing.T) {
 		t.Fatalf("got total=%d n=%d", total, n)
 	}
 }
+
+func TestCommittedGroupRows(t *testing.T) {
+	rows := []GroupTopicOffset{
+		{Topic: "a", Partition: 0, GroupOffset: -1},
+		{Topic: "a", Partition: 1, GroupOffset: 0},
+		{Topic: "b", Partition: 0, GroupOffset: 42},
+	}
+	got := committedGroupRows(rows)
+	if len(got) != 2 || got[0].Partition != 1 || got[1].Topic != "b" {
+		t.Fatalf("仅已提交分区可重置, got %#v", got)
+	}
+}

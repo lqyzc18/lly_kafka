@@ -12,7 +12,14 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-const defaultFetchTimeout = 8 * time.Second
+const (
+	// defaultFetchTimeout 单分区拉取未显式设置 deadline 时的兜底超时。
+	defaultFetchTimeout = 8 * time.Second
+	// allPartitionTimeout 全分区拉取的兜底超时（分区多、数据量大时需要更久）。
+	allPartitionTimeout = 30 * time.Second
+	// tempFetchMaxWait 临时 consumer 单次 PollFetches 的最长等待，避免长时间阻塞。
+	tempFetchMaxWait = 500 * time.Millisecond
+)
 
 // PartitionError 记录单个分区拉取失败的信息。
 type PartitionError struct {
@@ -22,6 +29,11 @@ type PartitionError struct {
 
 func (e PartitionError) Error() string {
 	return fmt.Sprintf("分区 %d: %v", e.Partition, e.Err)
+}
+
+// Unwrap 暴露底层错误，使 errors.Is/As 能识别超时、取消等语义。
+func (e PartitionError) Unwrap() error {
+	return e.Err
 }
 
 // PartitionErrors 聚合多个分区错误，便于 UI 层展示部分失败详情。
@@ -41,6 +53,31 @@ func (es PartitionErrors) Error() string {
 	return fmt.Sprintf("部分分区拉取失败 (%d/%d): %s", len(es.Failures), es.Total, strings.Join(parts, "; "))
 }
 
+// Unwrap 展开全部子错误，让 errors.Is(err, context.Canceled) 等判断可穿透聚合错误。
+func (es PartitionErrors) Unwrap() []error {
+	out := make([]error, 0, len(es.Failures))
+	for _, e := range es.Failures {
+		if e.Err != nil {
+			out = append(out, e.Err)
+		}
+	}
+	return out
+}
+
+// merge 追加另一组分区失败明细，用于合并批量边界与批量拉取的错误。
+func (es *PartitionErrors) merge(other PartitionErrors) {
+	if len(other.Failures) == 0 {
+		return
+	}
+	if es.Total < other.Total {
+		es.Total = other.Total
+	}
+	es.Failures = append(es.Failures, other.Failures...)
+	sort.Slice(es.Failures, func(i, j int) bool {
+		return es.Failures[i].Partition < es.Failures[j].Partition
+	})
+}
+
 // HeaderInfo 消息 Header
 type HeaderInfo struct {
 	Key   string
@@ -57,6 +94,13 @@ type MessageInfo struct {
 	Headers   []HeaderInfo
 	Timestamp time.Time
 	Size      int
+}
+
+// partitionRange 单个分区待拉取的半开区间 [From, ToEx)。
+type partitionRange struct {
+	Partition int32
+	From      int64
+	ToEx      int64
 }
 
 // NewestOffset 返回分区的最新 offset（HighWaterMark）。
@@ -90,43 +134,33 @@ func (kc *KafkaClient) OldestOffset(ctx context.Context, topic string, partition
 }
 
 // GetOffsetByTime 根据时间戳定位分区的起始 Offset。
-// 如果指定时间早于最旧数据，返回 OldestOffset；若晚于最新数据，返回 NewestOffset。
+//
+// 直接使用 Kafka 原生的 ListOffsets(timestamp) 能力，一次 RPC 完成定位；
+// 若指定时间早于最旧数据，broker 返回 log start offset；若晚于最新数据，
+// 返回当前 log end offset（此时区间为空）。
 func (kc *KafkaClient) GetOffsetByTime(ctx context.Context, topic string, partition int32, t time.Time) (int64, error) {
 	if err := kc.alive(ctx); err != nil {
 		return 0, err
 	}
-	oldest, hwm, err := kc.oldestAndNewest(ctx, topic, partition)
+	if t.IsZero() {
+		return kc.OldestOffset(ctx, topic, partition)
+	}
+	listed, err := kc.admin.ListOffsetsAfterMilli(ctx, t.UnixMilli(), topic)
 	if err != nil {
 		return 0, err
 	}
-	if t.IsZero() {
-		return oldest, nil
+	lo, ok := listed.Lookup(topic, partition)
+	if !ok {
+		return 0, fmt.Errorf("按时间定位分区 %d offset 失败", partition)
 	}
-	// franz-go 没有直接按时间查 offset 的 API，用二分查找。
-	// 先尝试从 oldest 开始读一条，如果该消息时间已晚于 t，直接返回 oldest。
-	// 否则用二分查找定位。
-	if hwm <= oldest {
-		return oldest, nil
+	if lo.Err != nil {
+		return 0, lo.Err
 	}
-
-	// 二分查找：找到第一个 timestamp >= t 的 offset
-	left, right := oldest, hwm
-	for left < right {
-		mid := left + (right-left)/2
-		// 读一条消息看时间戳
-		msgs, err := kc.FetchMessages(ctx, topic, partition, mid, mid+1, 1)
-		if err != nil || len(msgs) == 0 {
-			// 读不到，往右找
-			left = mid + 1
-			continue
-		}
-		if msgs[0].Timestamp.After(t) || msgs[0].Timestamp.Equal(t) {
-			right = mid
-		} else {
-			left = mid + 1
-		}
+	if lo.Offset < 0 {
+		// broker 未返回可用 offset，回落到该分区最新位置。
+		return kc.NewestOffset(ctx, topic, partition)
 	}
-	return left, nil
+	return lo.Offset, nil
 }
 
 func (kc *KafkaClient) oldestAndNewest(ctx context.Context, topic string, partition int32) (oldest, hwm int64, err error) {
@@ -157,17 +191,135 @@ func (kc *KafkaClient) oldestAndNewest(ctx context.Context, topic string, partit
 	return oldest, hwm, nil
 }
 
+// partitionBounds 一次性获取 Topic 各分区的 [oldest, hwm) 边界。
+// 单个分区失败只记录到 PartitionErrors，不影响其余分区。
+func (kc *KafkaClient) partitionBounds(ctx context.Context, topic string) (map[int32][2]int64, PartitionErrors, error) {
+	if err := kc.alive(ctx); err != nil {
+		return nil, PartitionErrors{}, err
+	}
+	starts, err := kc.admin.ListStartOffsets(ctx, topic)
+	if err != nil {
+		return nil, PartitionErrors{}, err
+	}
+	ends, err := kc.admin.ListEndOffsets(ctx, topic)
+	if err != nil {
+		return nil, PartitionErrors{}, err
+	}
+
+	ids := make(map[int32]struct{}, len(starts[topic])+len(ends[topic]))
+	for pid := range starts[topic] {
+		ids[pid] = struct{}{}
+	}
+	for pid := range ends[topic] {
+		ids[pid] = struct{}{}
+	}
+
+	bounds := make(map[int32][2]int64, len(ids))
+	partErrs := PartitionErrors{Total: len(ids)}
+	for pid := range ids {
+		so, sok := starts.Lookup(topic, pid)
+		if !sok || so.Err != nil {
+			partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: pid, Err: offsetLookupErr(so.Err, "起始")})
+			continue
+		}
+		eo, eok := ends.Lookup(topic, pid)
+		if !eok || eo.Err != nil {
+			partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: pid, Err: offsetLookupErr(eo.Err, "最新")})
+			continue
+		}
+		bounds[pid] = [2]int64{so.Offset, eo.Offset}
+	}
+	partErrs.sortFailures()
+	return bounds, partErrs, nil
+}
+
+func (es *PartitionErrors) sortFailures() {
+	sort.Slice(es.Failures, func(i, j int) bool {
+		return es.Failures[i].Partition < es.Failures[j].Partition
+	})
+}
+
+func offsetLookupErr(err error, kind string) error {
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("获取%s offset 失败", kind)
+}
+
+// latestRanges 为每个分区计算「最新 n 条」的规范化区间。
+func latestRanges(bounds map[int32][2]int64, n, max int) []partitionRange {
+	ranges := make([]partitionRange, 0, len(bounds))
+	for pid, b := range bounds {
+		from, toEx := normalizeFetchRange(b[0], b[1], latestStart(b[0], b[1], int64(n)), 0, max)
+		ranges = append(ranges, partitionRange{Partition: pid, From: from, ToEx: toEx})
+	}
+	sortRanges(ranges)
+	return ranges
+}
+
+// offsetRanges 为每个分区应用同一 offset 范围。
+func offsetRanges(bounds map[int32][2]int64, start, end int64, max int) []partitionRange {
+	ranges := make([]partitionRange, 0, len(bounds))
+	for pid, b := range bounds {
+		from, toEx := normalizeFetchRange(b[0], b[1], start, end, max)
+		ranges = append(ranges, partitionRange{Partition: pid, From: from, ToEx: toEx})
+	}
+	sortRanges(ranges)
+	return ranges
+}
+
+// timeRanges 为每个分区应用按时间定位得到的起始 offset。
+// starts 缺失仅用于未指定时间的场景；负值表示时间晚于最新消息。
+func timeRanges(bounds map[int32][2]int64, starts map[int32]int64, max int) []partitionRange {
+	ranges := make([]partitionRange, 0, len(bounds))
+	for pid, b := range bounds {
+		start := b[0]
+		if s, ok := starts[pid]; ok {
+			if s < 0 {
+				start = b[1]
+			} else {
+				start = s
+			}
+		}
+		from, toEx := normalizeFetchRange(b[0], b[1], start, 0, max)
+		ranges = append(ranges, partitionRange{Partition: pid, From: from, ToEx: toEx})
+	}
+	sortRanges(ranges)
+	return ranges
+}
+
+func sortRanges(ranges []partitionRange) {
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].Partition < ranges[j].Partition })
+}
+
+// perPartitionLimit 计算全分区拉取时每个分区的条数上限（至少 1 条）。
+func perPartitionLimit(max, partitions int) int {
+	if partitions <= 0 {
+		return max
+	}
+	per := max / partitions
+	if per < 1 {
+		per = 1
+	}
+	return per
+}
+
 // FetchLatest 拉取指定分区最新 n 条消息（不超过 max，且不早于 OldestOffset）。
 func (kc *KafkaClient) FetchLatest(ctx context.Context, topic string, partition int32, n, max int) ([]MessageInfo, error) {
 	if ctx == nil {
 		ctx = kc.Context()
 	}
+	n = latestCount(n, max)
 	oldest, hwm, err := kc.oldestAndNewest(ctx, topic, partition)
 	if err != nil {
 		return nil, err
 	}
-	start := latestStart(oldest, hwm, int64(n))
-	return kc.fetchRange(ctx, topic, partition, oldest, hwm, start, 0, max)
+	from, toEx := normalizeFetchRange(oldest, hwm, latestStart(oldest, hwm, int64(n)), 0, max)
+	msgs, partErrs, err := kc.fetchMany(ctx, topic, []partitionRange{{Partition: partition, From: from, ToEx: toEx}})
+	if err != nil {
+		return msgs, err
+	}
+	return msgs, firstPartitionErr(partErrs)
 }
 
 // FetchByTime 根据起始时间拉取指定分区的消息。
@@ -183,65 +335,53 @@ func (kc *KafkaClient) FetchByTime(ctx context.Context, topic string, partition 
 }
 
 // FetchByTimeAll 根据起始时间拉取该 Topic 所有分区的消息（合计不超过 max）。
+// 时间定位与消息拉取各只发起一次批量请求。
 func (kc *KafkaClient) FetchByTimeAll(ctx context.Context, topic string, startTime time.Time, max int) ([]MessageInfo, error) {
 	if ctx == nil {
 		ctx = kc.Context()
 	}
-	count, err := kc.PartitionCount(ctx, topic)
-	if err != nil {
-		return nil, err
-	}
-	if count <= 0 {
-		return []MessageInfo{}, nil
-	}
 	if max <= 0 {
 		max = defaultFetchMax
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, allPartitionTimeout)
 	defer cancel()
-	per := max / count
-	if per < 1 {
-		per = 1
+
+	bounds, partErrs, err := kc.partitionBounds(ctx, topic)
+	if err != nil {
+		return nil, err
+	}
+	if len(bounds) == 0 {
+		return []MessageInfo{}, emptyPartitionErrors(partErrs)
 	}
 
-	type partResult struct {
-		msgs []MessageInfo
-		err  error
-	}
-	results := make([]partResult, count)
-	runBounded(count, 8, func(i int) {
-		if ctxErr(ctx) != nil {
-			return
+	starts := make(map[int32]int64, len(bounds))
+	if !startTime.IsZero() {
+		listed, err := kc.admin.ListOffsetsAfterMilli(ctx, startTime.UnixMilli(), topic)
+		if err != nil {
+			return nil, err
 		}
-		msgs, e := kc.FetchByTime(ctx, topic, int32(i), startTime, per)
-		results[i] = partResult{msgs: msgs, err: e}
-	})
+		for pid := range bounds {
+			lo, ok := listed.Lookup(topic, pid)
+			if !ok || lo.Err != nil {
+				partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: pid, Err: offsetLookupErr(lo.Err, "按时间定位")})
+				delete(bounds, pid)
+				continue
+			}
+			starts[pid] = lo.Offset
+		}
+		partErrs.sortFailures()
+	}
+	if len(bounds) == 0 {
+		return []MessageInfo{}, emptyPartitionErrors(partErrs)
+	}
 
-	var all []MessageInfo
-	var partErrs PartitionErrors
-	partErrs.Total = count
-	for i, r := range results {
-		all = append(all, r.msgs...)
-		if r.err != nil {
-			partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: int32(i), Err: r.err})
-		}
+	per := perPartitionLimit(max, len(bounds))
+	all, fetchErrs, err := kc.fetchMany(ctx, topic, timeRanges(bounds, starts, per))
+	if err != nil {
+		return all, err
 	}
-	sort.Slice(all, func(i, j int) bool {
-		if !all[i].Timestamp.Equal(all[j].Timestamp) {
-			return all[i].Timestamp.After(all[j].Timestamp)
-		}
-		if all[i].Partition != all[j].Partition {
-			return all[i].Partition < all[j].Partition
-		}
-		return all[i].Offset > all[j].Offset
-	})
-	if len(all) > max {
-		all = all[:max]
-	}
-	if len(partErrs.Failures) > 0 {
-		return all, partErrs
-	}
-	return all, nil
+	partErrs.merge(fetchErrs)
+	return finishAllPartitions(all, partErrs, max, sortByRecency)
 }
 
 // FetchMessages 拉取指定分区的消息。
@@ -256,67 +396,40 @@ func (kc *KafkaClient) FetchMessages(ctx context.Context, topic string, partitio
 	if err != nil {
 		return nil, err
 	}
-	return kc.fetchRange(ctx, topic, partition, oldest, hwm, start, end, max)
+	from, toEx := normalizeFetchRange(oldest, hwm, start, end, max)
+	msgs, partErrs, err := kc.fetchMany(ctx, topic, []partitionRange{{Partition: partition, From: from, ToEx: toEx}})
+	if err != nil {
+		return msgs, err
+	}
+	return msgs, firstPartitionErr(partErrs)
 }
 
-// FetchLatestAll 拉取该 Topic 全部分区的最新 n 条（合计不超过 max）。
+// FetchLatestAll 拉取该 Topic 全部分区各自的最新 n 条，再按时间倒序取前 max 条。
 func (kc *KafkaClient) FetchLatestAll(ctx context.Context, topic string, n, max int) ([]MessageInfo, error) {
 	if ctx == nil {
 		ctx = kc.Context()
 	}
-	count, err := kc.PartitionCount(ctx, topic)
-	if err != nil {
-		return nil, err
-	}
-	if count <= 0 {
-		return []MessageInfo{}, nil
-	}
 	if max <= 0 {
 		max = defaultFetchMax
 	}
-	if n <= 0 {
-		n = 50
-	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	n = latestCount(n, max)
+	ctx, cancel := context.WithTimeout(ctx, allPartitionTimeout)
 	defer cancel()
 
-	type partResult struct {
-		msgs []MessageInfo
-		err  error
+	bounds, partErrs, err := kc.partitionBounds(ctx, topic)
+	if err != nil {
+		return nil, err
 	}
-	results := make([]partResult, count)
-	runBounded(count, 8, func(i int) {
-		if ctxErr(ctx) != nil {
-			return
-		}
-		msgs, e := kc.FetchLatest(ctx, topic, int32(i), n, n)
-		results[i] = partResult{msgs: msgs, err: e}
-	})
-	var all []MessageInfo
-	var partErrs PartitionErrors
-	partErrs.Total = count
-	for i, r := range results {
-		all = append(all, r.msgs...)
-		if r.err != nil {
-			partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: int32(i), Err: r.err})
-		}
+	if len(bounds) == 0 {
+		return []MessageInfo{}, emptyPartitionErrors(partErrs)
 	}
-	sort.Slice(all, func(i, j int) bool {
-		if !all[i].Timestamp.Equal(all[j].Timestamp) {
-			return all[i].Timestamp.After(all[j].Timestamp)
-		}
-		if all[i].Partition != all[j].Partition {
-			return all[i].Partition < all[j].Partition
-		}
-		return all[i].Offset > all[j].Offset
-	})
-	if len(all) > max {
-		all = all[:max]
+
+	all, fetchErrs, err := kc.fetchMany(ctx, topic, latestRanges(bounds, n, n))
+	if err != nil {
+		return all, err
 	}
-	if len(partErrs.Failures) > 0 {
-		return all, partErrs
-	}
-	return all, nil
+	partErrs.merge(fetchErrs)
+	return finishAllPartitions(all, partErrs, max, sortByRecency)
 }
 
 // FetchMessagesAll 对全部分区应用同一 offset 范围，合计不超过 max。
@@ -324,50 +437,33 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 	if ctx == nil {
 		ctx = kc.Context()
 	}
-	count, err := kc.PartitionCount(ctx, topic)
-	if err != nil {
-		return nil, err
-	}
 	if max <= 0 {
 		max = defaultFetchMax
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, allPartitionTimeout)
 	defer cancel()
-	per := max
-	if count > 0 {
-		per = max / count
-		if per < 1 {
-			per = 1
-		}
+
+	bounds, partErrs, err := kc.partitionBounds(ctx, topic)
+	if err != nil {
+		return nil, err
 	}
-	type partResult struct {
-		msgs []MessageInfo
-		err  error
+	if len(bounds) == 0 {
+		return []MessageInfo{}, emptyPartitionErrors(partErrs)
 	}
-	results := make([]partResult, count)
-	runBounded(count, 8, func(i int) {
-		if ctxErr(ctx) != nil {
-			return
-		}
-		msgs, e := kc.FetchMessages(ctx, topic, int32(i), start, end, per)
-		results[i] = partResult{msgs: msgs, err: e}
-	})
-	var all []MessageInfo
-	var partErrs PartitionErrors
-	partErrs.Total = count
-	for i, r := range results {
-		all = append(all, r.msgs...)
-		if r.err != nil {
-			partErrs.Failures = append(partErrs.Failures, PartitionError{Partition: int32(i), Err: r.err})
-		}
+
+	per := perPartitionLimit(max, len(bounds))
+	all, fetchErrs, err := kc.fetchMany(ctx, topic, offsetRanges(bounds, start, end, per))
+	if err != nil {
+		return all, err
 	}
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].Partition != all[j].Partition {
-			return all[i].Partition < all[j].Partition
-		}
-		return all[i].Offset < all[j].Offset
-	})
-	if len(all) > max {
+	partErrs.merge(fetchErrs)
+	return finishAllPartitions(all, partErrs, max, sortByOffset)
+}
+
+// finishAllPartitions 排序、截断并返回分区失败明细。
+func finishAllPartitions(all []MessageInfo, partErrs PartitionErrors, max int, less func(a, b MessageInfo) bool) ([]MessageInfo, error) {
+	sort.Slice(all, func(i, j int) bool { return less(all[i], all[j]) })
+	if max > 0 && len(all) > max {
 		all = all[:max]
 	}
 	if len(partErrs.Failures) > 0 {
@@ -376,39 +472,97 @@ func (kc *KafkaClient) FetchMessagesAll(ctx context.Context, topic string, start
 	return all, nil
 }
 
-// fetchRange 拉取指定分区的 offset 范围 [from, toEx)，内部创建临时 consumer。
-func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition int32, oldest, hwm, start, end int64, max int) ([]MessageInfo, error) {
-	from, toEx := normalizeFetchRange(oldest, hwm, start, end, max)
-	if from >= toEx {
-		return []MessageInfo{}, nil
+// emptyPartitionErrors 在无任何分区数据时，仍返回已有的分区失败明细。
+func emptyPartitionErrors(partErrs PartitionErrors) error {
+	if len(partErrs.Failures) > 0 {
+		return partErrs
 	}
+	return nil
+}
+
+// firstPartitionErr 将单分区拉取的分区错误还原为普通错误。
+func firstPartitionErr(partErrs PartitionErrors) error {
+	if len(partErrs.Failures) == 0 {
+		return nil
+	}
+	return partErrs.Failures[0].Err
+}
+
+// sortByRecency 按时间倒序；同一时间按分区升序、offset 降序。
+func sortByRecency(a, b MessageInfo) bool {
+	if !a.Timestamp.Equal(b.Timestamp) {
+		return a.Timestamp.After(b.Timestamp)
+	}
+	if a.Partition != b.Partition {
+		return a.Partition < b.Partition
+	}
+	return a.Offset > b.Offset
+}
+
+// sortByOffset 按分区升序、分区内 offset 升序。
+func sortByOffset(a, b MessageInfo) bool {
+	if a.Partition != b.Partition {
+		return a.Partition < b.Partition
+	}
+	return a.Offset < b.Offset
+}
+
+// appendRangeRecords uses record offsets rather than record counts: compacted
+// partitions can have holes within the requested interval.
+func appendRangeRecords(dst []MessageInfo, records []*kgo.Record, from, toEx int64) ([]MessageInfo, bool) {
+	if len(records) == 0 {
+		return dst, true
+	}
+	for _, r := range records {
+		if r.Offset >= toEx {
+			return dst, true
+		}
+		if r.Offset >= from {
+			dst = append(dst, toMessageInfo(r))
+		}
+	}
+	return dst, records[len(records)-1].Offset >= toEx-1
+}
+
+// fetchMany 用单个 consumer 同时拉取多个分区的目标区间。
+//
+// 相比「每个分区各建一个 consumer」，这里只做一次连接与元数据握手。
+// 返回值：
+//   - err 为全局错误（客户端已关闭、临时 consumer 创建失败、context 取消/超时）
+//   - PartitionErrors 记录 broker 针对具体分区返回的错误
+func (kc *KafkaClient) fetchMany(ctx context.Context, topic string, ranges []partitionRange) ([]MessageInfo, PartitionErrors, error) {
+	offsets := make(map[int32]kgo.Offset, len(ranges))
+	bounds := make(map[int32][2]int64, len(ranges))
+	var expect int64
+	for _, r := range ranges {
+		if r.From >= r.ToEx {
+			continue
+		}
+		offsets[r.Partition] = kgo.NewOffset().At(r.From)
+		bounds[r.Partition] = [2]int64{r.From, r.ToEx}
+		expect += r.ToEx - r.From
+	}
+	if len(offsets) == 0 {
+		return []MessageInfo{}, PartitionErrors{}, nil
+	}
+
 	if err := kc.beginFetch(ctx); err != nil {
-		return nil, err
+		return nil, PartitionErrors{}, err
 	}
 	defer kc.fetches.Done()
 
-	// franz-go 用 ConsumePartitions + PollFetches 按 offset 拉取
-	// 创建临时 client 专门用于这次拉取，避免污染共享 consumer
-	offsets := map[string]map[int32]kgo.Offset{
-		topic: {
-			partition: kgo.NewOffset().At(from),
-		},
-	}
-
-	// 复用现有 client 的连接配置，创建临时 consumer
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(parseBrokers(kc.conn.Brokers)...),
 		kgo.ClientID(kc.conn.ClientID),
-		kgo.ConsumePartitions(offsets),
-		kgo.FetchMaxWait(500 * time.Millisecond), // 快速返回，不阻塞
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: offsets}),
+		kgo.FetchMaxWait(tempFetchMaxWait),
 	}
-	// 复制安全设置
 	if err := applySecurity(&opts, kc.conn); err != nil {
-		return nil, err
+		return nil, PartitionErrors{}, err
 	}
 	tempClient, err := kgo.NewClient(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("创建临时 consumer 失败: %w", err)
+		return nil, PartitionErrors{}, fmt.Errorf("创建临时 consumer 失败: %w", err)
 	}
 	defer tempClient.Close()
 
@@ -418,28 +572,46 @@ func (kc *KafkaClient) fetchRange(ctx context.Context, topic string, partition i
 		defer cancel()
 	}
 
-	expect := toEx - from
+	var partErrs PartitionErrors
 	msgs := make([]MessageInfo, 0, expect)
-	for int64(len(msgs)) < expect {
+	for len(bounds) > 0 {
 		fetches := tempClient.PollFetches(ctx)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			// 取第一个错误返回
-			return msgs, fmt.Errorf("拉取出错: %w", errs[0].Err)
+		// 取消或超时优先按全局错误上报，让 UI 显示「已取消 / 超时」而非分区失败。
+		if err := ctx.Err(); err != nil {
+			return msgs, partErrs, fmt.Errorf("拉取未完成: %w", err)
 		}
-		if ctx.Err() != nil {
-			return msgs, fmt.Errorf("拉取未完成: %w", ctx.Err())
-		}
-
-		fetches.EachRecord(func(r *kgo.Record) {
-			msgs = append(msgs, toMessageInfo(r))
+		completed := make([]int32, 0)
+		fetches.EachPartition(func(p kgo.FetchTopicPartition) {
+			if p.Topic != topic || p.Err != nil {
+				return
+			}
+			b, tracked := bounds[p.Partition]
+			if !tracked {
+				return
+			}
+			var done bool
+			msgs, done = appendRangeRecords(msgs, p.Records, b[0], b[1])
+			if done {
+				delete(bounds, p.Partition)
+				completed = append(completed, p.Partition)
+			}
 		})
-
-		if len(msgs) == 0 {
-			// 没有数据，可能已到 HWM，退出
-			break
+		if len(completed) > 0 {
+			tempClient.PauseFetchPartitions(map[string][]int32{topic: completed})
+		}
+		if errs := fetches.Errors(); len(errs) > 0 {
+			for _, fe := range errs {
+				partErrs.Failures = append(partErrs.Failures, PartitionError{
+					Partition: fe.Partition,
+					Err:       fmt.Errorf("拉取出错: %w", fe.Err),
+				})
+			}
+			partErrs.Total = len(offsets)
+			partErrs.sortFailures()
+			return msgs, partErrs, nil
 		}
 	}
-	return msgs, nil
+	return msgs, partErrs, nil
 }
 
 // ProduceMessage 同步发送一条消息。partition < 0 时按 Key 哈希（无 Key 则随机）。
@@ -449,14 +621,12 @@ func (kc *KafkaClient) ProduceMessage(ctx context.Context, topic string, partiti
 	}
 
 	record := &kgo.Record{
-		Topic: topic,
-		Value: value,
+		Topic:     topic,
+		Value:     value,
+		Partition: partition,
 	}
 	if len(key) > 0 {
 		record.Key = key
-	}
-	if partition >= 0 {
-		record.Partition = partition
 	}
 	for k, v := range headers {
 		record.Headers = append(record.Headers, kgo.RecordHeader{Key: k, Value: []byte(v)})

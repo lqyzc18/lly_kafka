@@ -14,6 +14,22 @@ import (
 
 var errClientClosed = errors.New("kafka client 已关闭")
 
+// readOpTimeout 读类操作的默认超时。
+// 没有超时保护时，broker 无响应会让界面长期停留在「加载中」且无法重试。
+const readOpTimeout = 30 * time.Second
+
+// opCtx 为读操作补充默认超时；调用方已设置 deadline 时保持原样。
+// 返回的 context 派生自传入 ctx，因此仍然会在断开连接时被取消。
+func opCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, readOpTimeout)
+}
+
 // KafkaClient 对 franz-go 的封装，提供集群管理能力。
 // kgo.Client 天然支持并发和 context，无需懒加载 Consumer/Producer。
 type KafkaClient struct {
@@ -25,6 +41,10 @@ type KafkaClient struct {
 	conn   *Connection
 	client *kgo.Client
 	admin  *kadm.Client
+
+	// 连接握手时已经拿到元数据，这里缓存下来避免界面重复请求。
+	clusterID   string
+	brokerCount int
 
 	topicMu    sync.RWMutex
 	topicNames []string
@@ -47,8 +67,7 @@ func NewKafkaClient(ctx context.Context, conn *Connection) (*KafkaClient, error)
 		kgo.ClientID(conn.ClientID),
 		kgo.DialTimeout(8 * time.Second),
 		kgo.RequestTimeoutOverhead(5 * time.Second),
-		// 手动分区时直接按 record.Partition 发送。
-		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+		kgo.RecordPartitioner(newOptionalPartitioner()),
 	}
 
 	if err := applySecurity(&opts, conn); err != nil {
@@ -72,11 +91,13 @@ func NewKafkaClient(ctx context.Context, conn *Connection) (*KafkaClient, error)
 	cctx, cancelCtx := context.WithCancel(ctx)
 	cp := *conn
 	kc := &KafkaClient{
-		ctx:    cctx,
-		cancel: cancelCtx,
-		conn:   &cp,
-		client: client,
-		admin:  kadm.NewClient(client),
+		ctx:         cctx,
+		cancel:      cancelCtx,
+		conn:        &cp,
+		client:      client,
+		admin:       kadm.NewClient(client),
+		clusterID:   meta.Cluster,
+		brokerCount: len(meta.Brokers),
 	}
 	g.Log().Infof(ctx, "已连接 Kafka: %s (%s) security=%s, brokers=%d, cluster=%s",
 		conn.Name, conn.Brokers, conn.Security, len(meta.Brokers), meta.Cluster)
@@ -84,7 +105,8 @@ func NewKafkaClient(ctx context.Context, conn *Connection) (*KafkaClient, error)
 }
 
 // TestConnection 用独立客户端探测连通性，不占用主窗口当前连接。
-func TestConnection(ctx context.Context, conn *Connection) (version string, brokers int, err error) {
+// 返回集群 ID 与 Broker 数量，均为连接握手阶段已获取的信息，不额外发起请求。
+func TestConnection(ctx context.Context, conn *Connection) (clusterID string, brokers int, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -95,7 +117,7 @@ func TestConnection(ctx context.Context, conn *Connection) (version string, brok
 		return "", 0, err
 	}
 	defer kc.Close()
-	return kc.KafkaVersion(ctx), kc.BrokerCount(ctx), nil
+	return kc.ClusterID(), kc.BrokerCount(), nil
 }
 
 // Context 返回随 Close 取消的上下文，用于丢弃断开后的异步回调。
@@ -181,36 +203,22 @@ func (kc *KafkaClient) connName() string {
 	return kc.conn.Name
 }
 
-// KafkaVersion 返回协商后的 Kafka 版本字符串（实际为 API 版本上限）。
-func (kc *KafkaClient) KafkaVersion(ctx context.Context) string {
-	if kc.client == nil {
+// ClusterID 返回集群 ID（连接握手时获取并缓存，不额外发起请求）。
+// franz-go 自动协商协议版本，因此这里不再提供「Kafka 版本」，
+// 改为展示集群真实标识，避免向用户呈现无意义的占位值。
+func (kc *KafkaClient) ClusterID() string {
+	if kc == nil {
 		return ""
 	}
-	// franz-go 没有显式 "Kafka version"，返回 broker 支持的最大 API 版本。
-	// 这里简化处理：返回一个描述性字符串。
-	if ctx == nil {
-		ctx = kc.Context()
-	}
-	meta, err := kc.admin.BrokerMetadata(ctx)
-	if err != nil || len(meta.Brokers) == 0 {
-		return "unknown"
-	}
-	return "auto-negotiated"
+	return kc.clusterID
 }
 
-// BrokerCount 返回集群 Broker 数量。
-func (kc *KafkaClient) BrokerCount(ctx context.Context) int {
-	if kc.client == nil {
+// BrokerCount 返回连接时的 Broker 数量（缓存值，不额外发起请求）。
+func (kc *KafkaClient) BrokerCount() int {
+	if kc == nil {
 		return 0
 	}
-	if ctx == nil {
-		ctx = kc.Context()
-	}
-	meta, err := kc.admin.BrokerMetadata(ctx)
-	if err != nil {
-		return 0
-	}
-	return len(meta.Brokers)
+	return kc.brokerCount
 }
 
 // parseBrokers 解析逗号分隔的 broker 地址字符串。

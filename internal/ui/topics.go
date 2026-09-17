@@ -32,7 +32,10 @@ type topicsPanel struct {
 	infoLbl   *widget.Label
 	partTable *widget.Table
 	parts     []core.PartitionInfo
-	cfgLbl    *widget.Label
+	// partsFor 记录 parts 所属的 Topic，避免详情尚未返回时把上一个 Topic
+	// 的分区数用于删除确认或扩分区校验。
+	partsFor string
+	cfgLbl   *widget.Label
 }
 
 // newTopicsPanel 构造 Topic Tab。
@@ -203,6 +206,7 @@ func (p *topicsPanel) applyFilter() {
 			p.infoLbl.SetText("")
 		}
 		p.parts = nil
+		p.partsFor = ""
 		if p.partTable != nil {
 			p.partTable.Refresh()
 		}
@@ -243,6 +247,18 @@ func (p *topicsPanel) refresh() {
 // onSelect 处理 Topic 选中事件，触发详情加载。
 func (p *topicsPanel) onSelect(name string) {
 	p.selected = name
+	// 立即清空上一个 Topic 的详情，避免加载期间展示错位数据。
+	p.parts = nil
+	p.partsFor = ""
+	if p.cfgLbl != nil {
+		p.cfgLbl.SetText("")
+	}
+	if p.infoLbl != nil {
+		p.infoLbl.SetText("加载中...")
+	}
+	if p.partTable != nil {
+		p.partTable.Refresh()
+	}
 	p.refreshDetail()
 }
 
@@ -261,6 +277,10 @@ func (p *topicsPanel) refreshDetail() {
 		if err != nil {
 			p.detailTtl.SetText("加载失败: " + name)
 			p.infoLbl.SetText(err.Error())
+			p.parts = nil
+			p.partsFor = ""
+			p.partTable.Refresh()
+			p.cfgLbl.SetText("")
 			return
 		}
 		p.detailTtl.SetText(info.Name)
@@ -280,6 +300,7 @@ func (p *topicsPanel) refreshDetail() {
 		}
 		p.infoLbl.SetText(fmt.Sprintf("分区数: %d   副本因子: %d   约 %d 条消息%s", info.NumPartitions, info.ReplicationFactor, msgs, extra))
 		p.parts = info.Partitions
+		p.partsFor = name
 		p.partTable.Refresh()
 
 		keys := make([]string, 0, len(info.Configs))
@@ -362,8 +383,11 @@ func (p *topicsPanel) onDelete() {
 		return
 	}
 	name := p.selected
-	n := len(p.parts)
-	msg := fmt.Sprintf("确定删除 Topic「%s」吗？\n分区数: %d\n此操作不可恢复。", name, n)
+	// 详情尚未返回时不展示分区数，避免误用上一个 Topic 的数据。
+	msg := fmt.Sprintf("确定删除 Topic「%s」吗？\n此操作不可恢复。", name)
+	if p.partsFor == name && len(p.parts) > 0 {
+		msg = fmt.Sprintf("确定删除 Topic「%s」吗？\n分区数: %d\n此操作不可恢复。", name, len(p.parts))
+	}
 	dialog.ShowConfirm("确认删除", msg, func(ok bool) {
 		if !ok {
 			return
@@ -391,9 +415,9 @@ func (p *topicsPanel) onExpand() {
 		showInfo(p.win, "提示", "请先选择 Topic")
 		return
 	}
-	cur := int32(len(p.parts))
-	if cur == 0 {
-		cur = 1
+	cur := int32(1)
+	if p.partsFor == p.selected && len(p.parts) > 0 {
+		cur = int32(len(p.parts))
 	}
 	countE := widget.NewEntry()
 	countE.SetText(fmt.Sprintf("%d", cur+1))

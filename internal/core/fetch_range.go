@@ -2,6 +2,20 @@ package core
 
 const defaultFetchMax = 500
 
+// latestCount 在总上限小于 N 时，只请求真正需要的最新消息。
+func latestCount(n, max int) int {
+	if n <= 0 {
+		n = 50
+	}
+	if max <= 0 {
+		max = defaultFetchMax
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
 // latestStart 计算「最新 n 条」的起始 offset，并夹到 [oldest, hwm]。
 func latestStart(oldest, hwm, n int64) int64 {
 	if n <= 0 {

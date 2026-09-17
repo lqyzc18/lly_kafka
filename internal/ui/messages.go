@@ -53,6 +53,8 @@ type messagesPanel struct {
 	rows         []core.MessageInfo
 	fetchCancel  context.CancelFunc
 	fetchSeq     uint64
+	topicSeq     uint64
+	partSeq      uint64
 	restorePart  string
 	partUpdating bool
 }
@@ -252,9 +254,14 @@ func (p *messagesPanel) ensureLoaded() {
 
 // refresh 强制刷新 Topic 列表并恢复上次选择。
 func (p *messagesPanel) refresh() {
+	p.topicSeq++
+	seq := p.topicSeq
 	fetchAndShow(p.client.Context(), func() ([]string, error) {
 		return p.client.RefreshTopicNames(p.client.Context())
 	}, func(names []string, err error) {
+		if seq != p.topicSeq {
+			return
+		}
 		if err != nil {
 			showError(p.win, "获取 Topic 失败", err)
 			return
@@ -262,6 +269,7 @@ func (p *messagesPanel) refresh() {
 		p.topics = names
 		p.topicSel.SetOptions(names)
 		if len(names) == 0 {
+			p.invalidateFetch()
 			p.topicSel.SetSelected("")
 			p.partSel.Options = []string{}
 			p.partSel.SetSelected("")
@@ -281,9 +289,31 @@ func (p *messagesPanel) refresh() {
 	})
 }
 
+// invalidateFetch 丢弃旧请求及其结果，清空不再属于当前选择的消息。
+func (p *messagesPanel) invalidateFetch() {
+	p.fetchSeq++
+	if p.fetchCancel != nil {
+		p.fetchCancel()
+		p.fetchCancel = nil
+	}
+	p.allRows = nil
+	p.applyMsgFilter()
+	if p.btnCancel != nil {
+		p.btnCancel.Disable()
+	}
+}
+
 // refreshPartitions 加载所选 Topic 的分区列表，并恢复上次选择的分区。
 func (p *messagesPanel) refreshPartitions() {
+	p.invalidateFetch()
+	p.partSeq++
+	seq := p.partSeq
 	name := p.topicSel.Selected()
+	p.partUpdating = true
+	p.partSel.SetSelected("")
+	p.partSel.Options = nil
+	p.partSel.Refresh()
+	p.partUpdating = false
 	if name == "" {
 		return
 	}
@@ -296,20 +326,14 @@ func (p *messagesPanel) refreshPartitions() {
 	fetchAndShow(p.client.Context(), func() (int, error) {
 		return p.client.PartitionCount(p.client.Context(), name)
 	}, func(n int, err error) {
+		if seq != p.partSeq || p.topicSel.Selected() != name {
+			return
+		}
 		if err != nil {
-			if p.topicSel.Selected() != name {
-				return
-			}
-			if p.btnFetch != nil {
-				p.btnFetch.Enable()
-			}
 			if p.statusLbl != nil {
 				p.statusLbl.SetText("加载分区失败")
 			}
 			showError(p.win, "获取分区数失败", err)
-			return
-		}
-		if p.topicSel.Selected() != name {
 			return
 		}
 		opts := make([]string, 0, n+1)
@@ -418,6 +442,8 @@ func (p *messagesPanel) fetch(auto bool) {
 	seq := p.fetchSeq
 	fetchCtx, cancel := context.WithCancel(p.client.Context())
 	p.fetchCancel = cancel
+	p.allRows = nil
+	p.applyMsgFilter()
 
 	p.btnFetch.Disable()
 	p.btnCancel.Enable()
@@ -553,13 +579,19 @@ func (p *messagesPanel) onProduce() {
 			return
 		}
 		hdrs := parseKV(headersE.Text)
+		partition, err := parsePartitionInput(partE.Text)
+		if err != nil {
+			showInfo(p.win, "提示", err.Error())
+			d.Show()
+			return
+		}
 		var key []byte
 		if s := keyE.Text; s != "" {
 			key = []byte(s)
 		}
+		value := []byte(valE.Text)
 		go func() {
-			pid, offset, err := p.client.ProduceMessage(p.client.Context(), topic, int32(gconv.Int(partE.Text)),
-				key, []byte(valE.Text), hdrs)
+			pid, offset, err := p.client.ProduceMessage(p.client.Context(), topic, partition, key, value, hdrs)
 			fyne.Do(func() {
 				if p.client.Context().Err() != nil {
 					return
@@ -574,6 +606,18 @@ func (p *messagesPanel) onProduce() {
 	}, p.win)
 	d.Resize(fyne.NewSize(520, 420))
 	d.Show()
+}
+
+func parsePartitionInput(raw string) (int32, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return -1, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || n < -1 {
+		return 0, fmt.Errorf("分区必须是 -1 或非负整数")
+	}
+	return int32(n), nil
 }
 
 // exportedMessage 用于 JSON 导出的消息结构。

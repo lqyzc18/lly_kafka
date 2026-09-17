@@ -11,8 +11,13 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// versionOptions Kafka 版本下拉选项，franz-go 自动协商，此处仅作展示参考。
+// versionAuto 表示不指定版本（franz-go 自动协商）。
+const versionAuto = "自动协商"
+
+// versionOptions Kafka 版本下拉选项。
+// franz-go 会自动协商协议版本，该字段仅作为连接的备注信息保存，不影响连接行为。
 var versionOptions = []string{
+	versionAuto,
 	"4.0.0",
 	"3.9.0",
 	"3.6.0",
@@ -22,7 +27,6 @@ var versionOptions = []string{
 	"2.6.0",
 	"2.0.0",
 	"0.11.0",
-	"自动 (2.6.0)",
 }
 
 // securityOptions 安全协议下拉选项。
@@ -96,7 +100,7 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 		nameE.Disable()
 		brokersE.SetText(editing.Brokers)
 		if editing.Version == "" {
-			versionSel.SetSelected("自动 (2.6.0)")
+			versionSel.SetSelected(versionAuto)
 		} else {
 			versionSel.SetSelected(editing.Version)
 		}
@@ -120,7 +124,7 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 		keyE.SetText(editing.TLSKeyFile)
 	} else {
 		brokersE.SetText(mw.cfg.DefaultBrokers)
-		versionSel.SetSelected("自动 (2.6.0)")
+		versionSel.SetSelected(versionAuto)
 		clientIDE.SetText("lly-kafka")
 		secSel.SetSelected(core.SecurityPlaintext)
 		saslSel.SetSelected(core.SASLPlain)
@@ -130,7 +134,8 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 	collect := func() *core.Connection {
 		ver := versionSel.Selected
 		if strings.HasPrefix(ver, "自动") || ver == "" {
-			ver = "2.6.0"
+			// franz-go 自动协商，不把「自动」写成具体版本号，避免用户误以为需要指定版本。
+			ver = ""
 		}
 		conn := &core.Connection{
 			Name:          strings.TrimSpace(nameE.Text),
@@ -167,7 +172,7 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 		testCtx, seq := mw.beginTest()
 		testBtn.Disable()
 		go func() {
-			ver, n, err := core.TestConnection(testCtx, c)
+			clusterID, n, err := core.TestConnection(testCtx, c)
 			fyne.Do(func() {
 				if !mw.testCurrent(seq) {
 					return
@@ -177,7 +182,7 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 					showError(mw.win, "测试失败", err)
 					return
 				}
-				showInfo(mw.win, "测试成功", fmt.Sprintf("Kafka %s · %d brokers", ver, n))
+				showInfo(mw.win, "测试成功", fmt.Sprintf("集群 %s · %d brokers", clusterLabel(clusterID), n))
 			})
 		}()
 	})
@@ -185,7 +190,7 @@ func (mw *MainWindow) connectionDialog(editing *core.Connection) {
 	formItems := []*widget.FormItem{
 		{Text: "名称", Widget: nameE},
 		{Text: "Broker 地址", Widget: brokersE},
-		{Text: "Kafka 版本", Widget: versionSel},
+		{Text: "版本(仅备注)", Widget: versionSel},
 		{Text: "Client ID", Widget: clientIDE},
 		{Text: "安全协议", Widget: secSel},
 		{Text: "SASL 机制", Widget: saslSel},
@@ -265,7 +270,7 @@ func (mw *MainWindow) onTestConn() {
 	mw.setStatus("测试连接中...", widget.WarningImportance)
 	testCtx, seq := mw.beginTest()
 	go func() {
-		ver, n, err := core.TestConnection(testCtx, conn)
+		clusterID, n, err := core.TestConnection(testCtx, conn)
 		fyne.Do(func() {
 			if !mw.testCurrent(seq) {
 				return
@@ -281,7 +286,7 @@ func (mw *MainWindow) onTestConn() {
 				showError(mw.win, "测试失败", err)
 				return
 			}
-			showInfo(mw.win, "测试成功", fmt.Sprintf("%s · Kafka %s · %d brokers", conn.Name, ver, n))
+			showInfo(mw.win, "测试成功", fmt.Sprintf("%s · 集群 %s · %d brokers", conn.Name, clusterLabel(clusterID), n))
 		})
 	}()
 }

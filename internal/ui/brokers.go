@@ -114,9 +114,9 @@ func (p *brokersPanel) refresh() {
 	p.refreshSeq++
 	seq := p.refreshSeq
 	p.info.SetText("刷新中...")
-	fetchAndShow(p.client.Context(), func() ([]core.BrokerInfo, error) {
-		return p.client.ListBrokers(p.client.Context())
-	}, func(rows []core.BrokerInfo, err error) {
+	fetchAndShow(p.client.Context(), func() (*core.ClusterOverview, error) {
+		return p.client.LoadClusterOverview(p.client.Context())
+	}, func(ov *core.ClusterOverview, err error) {
 		if seq != p.refreshSeq || p.info == nil || p.table == nil {
 			return
 		}
@@ -125,8 +125,21 @@ func (p *brokersPanel) refresh() {
 			showError(p.win, "获取 Broker 失败", err)
 			return
 		}
-		p.rows = rows
-		p.info.SetText(fmt.Sprintf("共 %d 个 Broker | 协议版本: %s", len(rows), p.client.KafkaVersion(p.client.Context())))
+		p.rows = ov.Brokers
+		p.info.SetText(clusterSummary(ov))
 		p.table.Refresh()
 	})
+}
+
+// clusterSummary 汇总集群概览信息用于展示。
+func clusterSummary(ov *core.ClusterOverview) string {
+	if ov == nil {
+		return ""
+	}
+	ctrl := "-"
+	if b, ok := ov.Controller(); ok {
+		ctrl = fmt.Sprintf("#%d", b.ID)
+	}
+	return fmt.Sprintf("共 %d 个 Broker  ·  控制器 %s  ·  集群 ID %s",
+		len(ov.Brokers), ctrl, clusterLabel(ov.ClusterID))
 }
